@@ -1,0 +1,527 @@
+import express from 'express';
+import * as contentController from '../controllers/content.controller.js';
+import * as submissionController from '../controllers/submission.controller.js';
+import * as forumController from '../controllers/forum.controller.js';
+import * as quizController from '../controllers/quiz.controller.js';
+import Content from '../models/Content.js';
+import Course from '../models/Course.js';
+import ContentQuestion from '../models/ContentQuestion.js';
+import ContentAnswer from '../models/ContentAnswer.js';
+import { isAuthenticated, requireCourseManager, rejectStudentUploads } from '../middlewares/auth.middleware.js';
+import { uploadVideo, uploadFile, uploadSubmission, uploadContentImage, uploadQuestionAttachments } from '../middlewares/upload.middleware.js';
+import { verifyFileSignature } from '../middlewares/fileSignature.middleware.js';
+import { submitTaskLimiter, forumPostLimiter, contentCreateLimiter } from '../middlewares/rateLimit.middleware.js';
+import { validateFieldLengths } from '../middlewares/validateFieldLengths.middleware.js';
+import { t } from '../utils/i18n.js';
+
+const router = express.Router();
+
+/**
+ * Resuelve el course_id de un contenido existente a partir de su :id de
+ * ruta — para las rutas PUT/DELETE /:id, que no traen course_id directo.
+ */
+async function courseIdFromContentParam(req) {
+  const content = await Content.findById(req.params.id);
+  return content ? content.course_id : null;
+}
+
+/**
+ * Igual que courseIdFromContentParam, pero resolviendo desde el :answerId
+ * de PUT /answers/:answerId/grade (answer -> question -> content -> curso).
+ */
+async function courseIdFromAnswerParam(req) {
+  const answer = await ContentAnswer.findById(req.params.answerId);
+  if (!answer) return null;
+  const question = await ContentQuestion.findById(answer.question_id);
+  if (!question) return null;
+  const content = await Content.findById(question.content_id);
+  return content ? content.course_id : null;
+}
+
+/**
+ * Resuelve el folder_id (módulo) de un contenido EXISTENTE a partir de su
+ * :id de ruta — usado junto con courseIdFromContentParam para que un
+ * profesor escopeado a un módulo (course_teachers.module_id) solo pueda
+ * gestionar contenido de SU módulo. Una carpeta siempre tiene folder_id
+ * null, así que renombrar/borrar una carpeta sigue siendo de-todo-el-curso
+ * automáticamente, sin caso especial.
+ */
+async function folderIdFromContentParam(req) {
+  const content = await Content.findById(req.params.id);
+  return content ? content.folder_id : null;
+}
+
+/**
+ * Igual que folderIdFromContentParam, pero resolviendo desde el :answerId
+ * de PUT /answers/:answerId/grade (answer -> question -> content -> módulo).
+ */
+async function folderIdFromAnswerParam(req) {
+  const answer = await ContentAnswer.findById(req.params.answerId);
+  if (!answer) return null;
+  const question = await ContentQuestion.findById(answer.question_id);
+  if (!question) return null;
+  const content = await Content.findById(question.content_id);
+  return content ? content.folder_id : null;
+}
+
+/**
+ * Guard compartido por las rutas de creación SIN archivo (text/url/quiz/
+ * survey/forum): admin, o el profesor asignado al curso del body (de todo
+ * el curso, o escopeado al módulo indicado en body.folder_id). Las que sí
+ * llevan archivo (video/file/image/task) no pueden reusar esto tal cual —
+ * ahí multer debe correr ANTES, porque course_id/folder_id son campos del
+ * multipart/form-data y no existen en req.body hasta que se parsea.
+ */
+const courseManagerFromBody = [
+  isAuthenticated,
+  contentCreateLimiter,
+  requireCourseManager((req) => req.body.course_id, (req) => req.body.folder_id || null),
+  validateFieldLengths('title', 'description', 'url', 'title_en', 'description_en')
+];
+
+// ==============================================
+// RUTAS ESPECÍFICAS PRIMERO (antes de /:id)
+// ==============================================
+
+/**
+ * GET /api/contents/course/:courseId/quiz-status
+ * Estado del usuario en todos los quizzes/encuestas del curso (una sola
+ * petición en vez de una por quiz). Ver quiz.controller.js.
+ */
+router.get('/course/:courseId/quiz-status', isAuthenticated, quizController.getQuizStatusByCourse);
+
+/**
+ * GET /api/contents/course/:courseId
+ */
+router.get('/course/:courseId', contentController.getContentsByCourse);
+
+/**
+ * PUT /api/contents/course/:courseId/reorder
+ * Admin, o el profesor asignado a ese curso
+ */
+router.put(
+  '/course/:courseId/reorder',
+  isAuthenticated,
+  requireCourseManager((req) => req.params.courseId),
+  contentController.reorderContents
+);
+
+/**
+ * POST /api/contents/video
+ * Admin, o el profesor asignado al curso del body.
+ * multer va primero: course_id es un campo del multipart/form-data, no
+ * existe en req.body hasta que se parsea. requireCourseManager limpia el
+ * archivo del disco si termina rechazando la petición.
+ * rejectStudentUploads va ANTES de multer: un estudiante nunca puede crear
+ * contenido, así que no tiene sentido dejar que el servidor escriba a
+ * disco un video de hasta 2GB solo para rechazarlo después (ver su
+ * comentario en auth.middleware.js).
+ */
+router.post(
+  '/video',
+  isAuthenticated,
+  rejectStudentUploads,
+  contentCreateLimiter,
+  uploadVideo.single('video'),
+  requireCourseManager((req) => req.body.course_id, (req) => req.body.folder_id || null),
+  validateFieldLengths('title', 'description', 'title_en', 'description_en'),
+  verifyFileSignature('video'),
+  contentController.createVideoContent
+);
+
+/**
+ * POST /api/contents/file
+ * Admin, o el profesor asignado al curso del body (ver nota de orden en
+ * POST /video).
+ */
+router.post(
+  '/file',
+  isAuthenticated,
+  rejectStudentUploads,
+  contentCreateLimiter,
+  uploadFile.single('file'),
+  requireCourseManager((req) => req.body.course_id, (req) => req.body.folder_id || null),
+  validateFieldLengths('title', 'description', 'title_en', 'description_en'),
+  verifyFileSignature('file'),
+  contentController.createFileContent
+);
+
+/**
+ * POST /api/contents/image
+ * Admin, o el profesor asignado al curso del body (ver nota de orden en
+ * POST /video).
+ */
+router.post(
+  '/image',
+  isAuthenticated,
+  rejectStudentUploads,
+  contentCreateLimiter,
+  uploadContentImage.single('image'),
+  requireCourseManager((req) => req.body.course_id, (req) => req.body.folder_id || null),
+  validateFieldLengths('title', 'description', 'title_en', 'description_en'),
+  verifyFileSignature('image'),
+  contentController.createImageContent
+);
+
+/**
+ * POST /api/contents/text
+ * Admin, o el profesor asignado al curso del body. Sin archivo (JSON
+ * puro), así que aquí sí req.body.course_id ya está disponible antes de
+ * requireCourseManager sin necesitar multer.
+ */
+router.post('/text', ...courseManagerFromBody, contentController.createTextContent);
+
+/**
+ * POST /api/contents/url
+ * Admin, o el profesor asignado al curso del body. Igual que /text, sin
+ * archivo.
+ */
+router.post('/url', ...courseManagerFromBody, contentController.createUrlContent);
+
+/**
+ * POST /api/contents/quiz
+ * Admin, o el profesor asignado al curso del body. multer va primero igual
+ * que /video/file/image: `questions` viaja como JSON-string dentro de un
+ * multipart/form-data (no JSON puro) porque una pregunta puede traer su
+ * propio adjunto (imagen o video, ver quiz.controller.js), y course_id es
+ * un campo del multipart que requireCourseManager necesita ya parseado.
+ * uploadQuestionAttachments acepta CUALQUIER archivo (`.any()`, nombrados
+ * question_attachment_<índice>) porque distintas preguntas del mismo
+ * cuestionario pueden mezclar imagen y video — la firma/tamaño de cada uno
+ * se verifica dentro del controlador, que sí sabe el tipo declarado por
+ * cada pregunta.
+ */
+router.post(
+  '/quiz',
+  isAuthenticated,
+  rejectStudentUploads,
+  contentCreateLimiter,
+  uploadQuestionAttachments,
+  requireCourseManager((req) => req.body.course_id, (req) => req.body.folder_id || null),
+  validateFieldLengths('title', 'description', 'title_en', 'description_en'),
+  quizController.createQuizContent
+);
+
+/**
+ * POST /api/contents/survey
+ * Admin, o el profesor asignado al curso del body. Comparte controlador y
+ * validación con /quiz (ver quiz.controller.js) — solo cambia el tipo.
+ */
+router.post(
+  '/survey',
+  isAuthenticated,
+  rejectStudentUploads,
+  contentCreateLimiter,
+  uploadQuestionAttachments,
+  requireCourseManager((req) => req.body.course_id, (req) => req.body.folder_id || null),
+  validateFieldLengths('title', 'description', 'title_en', 'description_en'),
+  quizController.createSurveyContent
+);
+
+/**
+ * PUT /api/contents/answers/:answerId/grade
+ * Calificación manual de una respuesta corta (multiple_choice/true_false
+ * ya se autocalifican al enviar). Admin, o el profesor asignado al curso
+ * dueño de la pregunta.
+ */
+router.put(
+  '/answers/:answerId/grade',
+  isAuthenticated,
+  requireCourseManager(courseIdFromAnswerParam, folderIdFromAnswerParam),
+  quizController.gradeAnswer
+);
+
+/**
+ * POST /api/contents/task
+ * Admin, o el profesor asignado al curso del body. El archivo de
+ * instrucciones es opcional (a diferencia de /video y /file), pero sigue
+ * yendo por multer primero por la misma razón: course_id es un campo del
+ * multipart/form-data.
+ */
+router.post(
+  '/task',
+  isAuthenticated,
+  rejectStudentUploads,
+  contentCreateLimiter,
+  uploadFile.single('file'),
+  requireCourseManager((req) => req.body.course_id, (req) => req.body.folder_id || null),
+  validateFieldLengths('title', 'description', 'title_en', 'description_en'),
+  (req, res, next) => {
+    if (!req.file) return next();
+    verifyFileSignature('file')(req, res, next);
+  },
+  contentController.createTaskContent
+);
+
+/**
+ * POST /api/contents/forum
+ * Crea el tema (post principal) de un foro. Admin, o el profesor asignado
+ * al curso del body. Igual que /text: sin archivo.
+ */
+router.post('/forum', ...courseManagerFromBody, contentController.createForumContent);
+
+/**
+ * POST /api/contents/folder
+ * Crea una carpeta para agrupar otro contenido del curso. Admin, o el
+ * profesor asignado al curso del body. Sin archivo.
+ */
+router.post('/folder', ...courseManagerFromBody, contentController.createFolderContent);
+
+// ==============================================
+// RUTAS CON PARÁMETRO /:id Y SUBRUTAS
+// ==============================================
+
+/**
+ * POST /api/contents/:id/complete
+ * Marcar contenido como completado
+ */
+router.post('/:id/complete', isAuthenticated, contentController.markContentCompleted);
+
+/**
+ * DELETE /api/contents/:id/complete
+ * Desmarcar contenido como completado
+ */
+router.delete('/:id/complete', isAuthenticated, contentController.markContentIncomplete);
+
+/**
+ * GET /api/contents/:id/download
+ */
+router.get('/:id/download', isAuthenticated, contentController.downloadFile);
+
+/**
+ * POST /api/contents/:id/submit
+ * Entregar una tarea. Antes de multer se valida que la tarea exista, que
+ * sea type='task', y que el usuario esté inscrito — así no se escribe el
+ * archivo en disco si algo de eso falla (a diferencia de POST
+ * /video|/file|/task, aquí SÍ se puede resolver todo desde req.params.id,
+ * sin depender del body, por eso el orden es al revés que ahí).
+ */
+router.post(
+  '/:id/submit',
+  isAuthenticated,
+  async (req, res, next) => {
+    try {
+      const content = await Content.findById(req.params.id);
+      if (!content) {
+        return res.status(404).json({ success: false, message: t(req.locale, 'errors.task_not_found') });
+      }
+      if (content.type !== 'task') {
+        return res.status(400).json({ success: false, message: t(req.locale, 'errors.content_not_task') });
+      }
+      const enrolled = await Course.isUserEnrolled(content.course_id, req.session.user.id);
+      if (!enrolled) {
+        return res.status(403).json({
+          success: false,
+          message: t(req.locale, 'errors.enroll_to_submit_task')
+        });
+      }
+      req.taskContent = content;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  },
+  submitTaskLimiter,
+  uploadSubmission.single('file'),
+  verifyFileSignature('file'),
+  submissionController.submitTask
+);
+
+/**
+ * GET /api/contents/:id/submission
+ * La propia entrega del usuario autenticado para esta tarea.
+ */
+router.get('/:id/submission', isAuthenticated, submissionController.getMySubmission);
+
+/**
+ * GET /api/contents/:id/submissions
+ * Todas las entregas de la tarea. Admin, o el profesor asignado al curso.
+ */
+router.get(
+  '/:id/submissions',
+  isAuthenticated,
+  requireCourseManager(courseIdFromContentParam, folderIdFromContentParam),
+  submissionController.listSubmissions
+);
+
+/**
+ * GET /api/contents/:id/questions
+ * Preguntas de un cuestionario/encuesta para responder (o, si ya
+ * respondió, sus propias respuestas). El control de acceso fino
+ * (inscrito/profesor/admin) se hace dentro del controlador, igual que
+ * GET /:id/download.
+ */
+router.get('/:id/questions', isAuthenticated, quizController.getQuestions);
+
+/**
+ * POST /api/contents/:id/answers
+ * Envía todas las respuestas de un cuestionario/encuesta de una vez. Mismo
+ * patrón de pre-check inline que /:id/submit: valida que el content
+ * exista, sea quiz/survey, y que el usuario esté inscrito, antes de tocar
+ * la base de datos.
+ */
+router.post(
+  '/:id/answers',
+  isAuthenticated,
+  // Mismo limiter que /submit (entregas de tarea) — antes era el único
+  // endpoint de escritura sin ninguno. No explotable como tal (el UNIQUE
+  // de content_answers ya evita respuestas duplicadas), pero rompía la
+  // simetría de protección con el resto de endpoints equivalentes.
+  submitTaskLimiter,
+  async (req, res, next) => {
+    try {
+      const content = await Content.findById(req.params.id);
+      if (!content) {
+        return res.status(404).json({ success: false, message: t(req.locale, 'errors.content_not_found') });
+      }
+      if (!['quiz', 'survey'].includes(content.type)) {
+        return res.status(400).json({ success: false, message: t(req.locale, 'errors.not_quiz_or_survey') });
+      }
+      const enrolled = await Course.isUserEnrolled(content.course_id, req.session.user.id);
+      if (!enrolled) {
+        return res.status(403).json({
+          success: false,
+          message: t(req.locale, 'errors.enroll_to_answer_generic')
+        });
+      }
+      req.quizContent = content;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  },
+  quizController.submitAnswers
+);
+
+/**
+ * GET /api/contents/:id/results
+ * Resultados de un cuestionario/encuesta. Admin, o el profesor asignado
+ * al curso.
+ */
+router.get(
+  '/:id/results',
+  isAuthenticated,
+  requireCourseManager(courseIdFromContentParam, folderIdFromContentParam),
+  quizController.getResults
+);
+
+/**
+ * GET /api/contents/:id/questions/:questionId/answers
+ * Una página de las respuestas de una pregunta de respuesta corta (el resto
+ * de las que /results no manda completas). Admin, o el profesor asignado al
+ * curso.
+ */
+router.get(
+  '/:id/questions/:questionId/answers',
+  isAuthenticated,
+  requireCourseManager(courseIdFromContentParam, folderIdFromContentParam),
+  quizController.getShortAnswers
+);
+
+/**
+ * GET /api/contents/:id/questions/manage
+ * Preguntas de un cuestionario/encuesta para editar (con is_correct
+ * siempre incluido y el conteo de respondentes). Admin, o el profesor
+ * asignado al curso.
+ */
+router.get(
+  '/:id/questions/manage',
+  isAuthenticated,
+  requireCourseManager(courseIdFromContentParam, folderIdFromContentParam),
+  quizController.getQuestionsForManage
+);
+
+/**
+ * PUT /api/contents/:id/questions
+ * Reemplaza título/descripción/tipo de pregunta y todas las preguntas de
+ * un cuestionario/encuesta. Solo funciona mientras nadie respondió
+ * todavía (ver quiz.controller.js). Admin, o el profesor asignado al curso.
+ * multer va primero por consistencia con POST /quiz (mismo `questions`
+ * como JSON-string + adjuntos nombrados question_attachment_<índice>) —
+ * acá course_id no hace falta parsearlo antes porque requireCourseManager
+ * ya lo resuelve desde :id, no del body.
+ */
+router.put(
+  '/:id/questions',
+  isAuthenticated,
+  rejectStudentUploads,
+  uploadQuestionAttachments,
+  requireCourseManager(courseIdFromContentParam, folderIdFromContentParam),
+  validateFieldLengths('title', 'description', 'title_en', 'description_en'),
+  quizController.updateQuestions
+);
+
+/**
+ * GET /api/contents/:id/forum
+ * Tema + respuestas de un foro. Admin, inscrito, o profesor asignado.
+ */
+router.get('/:id/forum', isAuthenticated, forumController.listPosts);
+
+/**
+ * POST /api/contents/:id/forum
+ * Publica una respuesta en el foro. Mismo acceso que ver el hilo — a
+ * diferencia de crear el TEMA (POST /forum, solo admin/profesor), acá
+ * cualquier admin/inscrito/profesor puede responder.
+ */
+router.post('/:id/forum', isAuthenticated, forumPostLimiter, validateFieldLengths('body'), forumController.createPost);
+
+/**
+ * GET /api/contents/:id
+ */
+router.get('/:id', contentController.getContentById);
+
+/**
+ * PUT /api/contents/:id
+ * Admin, o el profesor asignado al curso dueño de este contenido
+ */
+router.put(
+  '/:id',
+  isAuthenticated,
+  requireCourseManager(courseIdFromContentParam, folderIdFromContentParam),
+  (req, res, next) => {
+    const handleUpload = async (req, res, next) => {
+      try {
+        const content = await Content.findById(req.params.id);
+
+        if (!content) return next();
+
+        req.contentType = content.type;
+
+        // Texto, URL, el post principal de un foro, y una carpeta no
+        // llevan archivo — no tiene sentido pasarlos por
+        // multer/verifyFileSignature (que esperan un req.file). Una
+        // carpeta solo se actualiza para cambiarle el título o moverla
+        // (folder_id no aplica a una carpeta, ver updateContent).
+        if (['text', 'url', 'forum', 'folder', 'quiz', 'survey'].includes(content.type)) {
+          return next();
+        }
+
+        if (content.type === 'video') {
+          return uploadVideo.single('video')(req, res, next);
+        } else if (content.type === 'image') {
+          return uploadContentImage.single('image')(req, res, next);
+        } else {
+          return uploadFile.single('file')(req, res, next);
+        }
+      } catch (error) {
+        next(error);
+      }
+    };
+    handleUpload(req, res, next);
+  },
+  validateFieldLengths('title', 'description', 'url', 'title_en', 'description_en'),
+  (req, res, next) => {
+    if (['text', 'url', 'forum', 'folder', 'quiz', 'survey'].includes(req.contentType)) return next();
+    const signatureKind = req.contentType === 'video' ? 'video' : req.contentType === 'image' ? 'image' : 'file';
+    verifyFileSignature(signatureKind)(req, res, next);
+  },
+  contentController.updateContent
+);
+
+/**
+ * DELETE /api/contents/:id
+ * Admin, o el profesor asignado al curso dueño de este contenido
+ */
+router.delete('/:id', isAuthenticated, requireCourseManager(courseIdFromContentParam, folderIdFromContentParam), contentController.deleteContent);
+
+export default router;

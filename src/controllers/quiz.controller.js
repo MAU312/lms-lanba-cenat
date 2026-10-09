@@ -1,0 +1,865 @@
+import Content from '../models/Content.js';
+import ContentQuestion from '../models/ContentQuestion.js';
+import ContentAnswer from '../models/ContentAnswer.js';
+import Course from '../models/Course.js';
+import pool from '../config/db.js';
+import { t } from '../utils/i18n.js';
+import { FIELD_LIMITS, exceedsFieldLimit } from '../middlewares/validateFieldLengths.middleware.js';
+import { parsePagination, buildPagination } from '../utils/pagination.js';
+import { deleteFile, MAX_IMAGE_SIZE_BYTES, MAX_VIDEO_SIZE_BYTES } from '../middlewares/upload.middleware.js';
+import { checkFileSignature } from '../middlewares/fileSignature.middleware.js';
+
+// Respuestas de una pregunta de respuesta corta que vienen ya incluidas en
+// /results; el resto se pide de a páginas (ver getShortAnswers). Sin tope,
+// un quiz con 100 preguntas cortas y 150 estudiantes mandaba 3,4 MB y el
+// navegador dibujaba 151.000 nodos.
+const RESULTS_INLINE_SHORT_ANSWERS = 20;
+
+const QUESTION_TYPES = ['short_answer', 'multiple_choice', 'true_false'];
+const QUESTION_ATTACHMENT_TYPES = ['image', 'video', 'url'];
+// Igual que URL_REGEX en content.controller.js (no se comparte el módulo a
+// propósito, mismo criterio que resolveFolderId/parseWeightPercent de más
+// abajo).
+const URL_REGEX = /^https?:\/\/.+/i;
+
+/**
+ * Igual que resolveFolderId en content.controller.js (no se comparte el
+ * módulo a propósito, para no acoplar los dos controladores por un helper
+ * de 8 líneas): folder_id vacío/null/undefined = "sin carpeta"; si viene,
+ * debe existir, ser type='folder', y pertenecer al mismo curso.
+ */
+/**
+ * Igual que parseWeightPercent en content.controller.js (no se comparte el
+ * módulo a propósito, mismo criterio que resolveFolderId): vacío/undefined
+ * = "no cuenta para la nota del curso" (null), no un error. Solo un quiz
+ * puede tener peso — una encuesta nunca se califica, así que no tiene
+ * sentido que cuente para la nota.
+ */
+function parseWeightPercent(input, locale) {
+  if (input === undefined || input === null || input === '') {
+    return { ok: true, value: null };
+  }
+  const value = Number(input);
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    return { ok: false, message: t(locale, 'errors.weight_percent_invalid') };
+  }
+  return { ok: true, value };
+}
+
+async function resolveFolderId(folderIdInput, courseId) {
+  if (folderIdInput === undefined || folderIdInput === null || folderIdInput === '') {
+    return { ok: true, folderId: null };
+  }
+  const folder = await Content.findById(folderIdInput);
+  if (!folder || folder.type !== 'folder' || String(folder.course_id) !== String(courseId)) {
+    return { ok: false };
+  }
+  return { ok: true, folderId: folder.id };
+}
+
+/**
+ * Valida el array de preguntas/opciones — compartido entre crear
+ * (createQuestionContent) y reemplazar (updateQuestions) un set de
+ * preguntas. El tipo se elige por pregunta (se pueden mezclar
+ * multiple_choice/true_false/short_answer en el mismo cuestionario), misma
+ * regla para cada una:
+ * - quiz: exactamente una opción correcta por pregunta (multiple_choice/
+ *   true_false). short_answer no lleva opciones, la revisa el profesor.
+ * - survey: nunca hay respuesta correcta (is_correct del cliente se ignora
+ *   al insertar, ver insertQuestions).
+ */
+function validateQuestions(questions, isQuiz, locale) {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return { ok: false, message: t(locale, 'errors.at_least_one_question') };
+  }
+
+  for (const q of questions) {
+    if (!QUESTION_TYPES.includes(q.question_type)) {
+      return { ok: false, message: t(locale, 'errors.invalid_question_type') };
+    }
+    if (!q.text || !String(q.text).trim()) {
+      return { ok: false, message: t(locale, 'errors.question_text_required') };
+    }
+    if (exceedsFieldLimit('question_text', String(q.text).trim())) {
+      return { ok: false, message: t(locale, 'errors.question_text_too_long') };
+    }
+    // text_en es 100% opcional (ver four_feature_batch/item 2): solo se
+    // valida el límite de longitud si el profesor lo llenó.
+    if (q.text_en !== undefined && q.text_en !== null && String(q.text_en).trim() && exceedsFieldLimit('question_text', String(q.text_en).trim())) {
+      return { ok: false, message: t(locale, 'errors.question_text_too_long') };
+    }
+    if (q.points !== undefined && (!Number.isInteger(q.points) || q.points < 1)) {
+      return { ok: false, message: t(locale, 'errors.question_points_invalid') };
+    }
+
+    // Adjunto opcional (imagen/video/URL, uno solo por pregunta — ver
+    // resolveQuestionAttachments para el resto de la validación, que
+    // necesita los archivos ya subidos por multer).
+    if (q.attachment_type !== undefined && q.attachment_type !== null) {
+      if (!QUESTION_ATTACHMENT_TYPES.includes(q.attachment_type)) {
+        return { ok: false, message: t(locale, 'errors.invalid_question_attachment_type') };
+      }
+      if (q.attachment_type === 'url' && (!q.attachment_url || !URL_REGEX.test(String(q.attachment_url).trim()))) {
+        return { ok: false, message: t(locale, 'errors.invalid_url_format') };
+      }
+    }
+
+    const needsOptions = q.question_type === 'multiple_choice' || q.question_type === 'true_false';
+    if (needsOptions) {
+      const options = Array.isArray(q.options) ? q.options : [];
+      if (options.length < 2) {
+        return { ok: false, message: t(locale, 'errors.min_two_options') };
+      }
+      if (q.question_type === 'true_false' && options.length !== 2) {
+        return { ok: false, message: t(locale, 'errors.true_false_two_options') };
+      }
+      if (!options.every((o) => o.text && String(o.text).trim())) {
+        return { ok: false, message: t(locale, 'errors.option_text_required') };
+      }
+      if (options.some((o) => exceedsFieldLimit('option_text', String(o.text).trim()))) {
+        return { ok: false, message: t(locale, 'errors.option_text_too_long', { max: FIELD_LIMITS.option_text.max }) };
+      }
+      if (options.some((o) => o.text_en && String(o.text_en).trim() && exceedsFieldLimit('option_text', String(o.text_en).trim()))) {
+        return { ok: false, message: t(locale, 'errors.option_text_too_long', { max: FIELD_LIMITS.option_text.max }) };
+      }
+      if (isQuiz && options.filter((o) => o.is_correct).length !== 1) {
+        return { ok: false, message: t(locale, 'errors.exactly_one_correct_option') };
+      }
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Inserta las preguntas (y opciones) de un quiz/survey ya validado, dentro
+ * de la connection de una transacción — compartido entre crear y
+ * reemplazar un set de preguntas. Cada pregunta lleva su propio
+ * question_type.
+ */
+async function insertQuestions(contentId, questions, isQuiz, connection) {
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    const needsOptions = q.question_type === 'multiple_choice' || q.question_type === 'true_false';
+    const questionId = await ContentQuestion.create(
+      contentId, String(q.text).trim(), i, q.points || 1, q.question_type, connection,
+      q.attachment_type || null, q.attachment_type ? q.attachment_url : null,
+      q.text_en && String(q.text_en).trim() ? String(q.text_en).trim() : null
+    );
+    if (needsOptions) {
+      const options = q.options.map((o, idx) => ({
+        text: String(o.text).trim(),
+        text_en: o.text_en && String(o.text_en).trim() ? String(o.text_en).trim() : null,
+        // Una encuesta nunca guarda respuesta correcta, sin importar lo
+        // que mande el cliente.
+        is_correct: isQuiz ? !!o.is_correct : false,
+        order_index: idx
+      }));
+      await ContentQuestion.createOptions(questionId, options, connection);
+    }
+  }
+}
+
+function questionAttachmentUrl(filename) {
+  return `/uploads/question-attachments/${filename}`;
+}
+
+/**
+ * `questions` llega como JSON-string dentro de `req.body` (multer/
+ * multipart no puede mandar un array anidado como campo normal, a
+ * diferencia de un POST JSON puro) — pero los tests de este archivo
+ * mockean `req.body.questions` como un array real, sin pasar por multer.
+ * Acepta las dos formas para no romper esos tests ni duplicar su mockeo.
+ */
+function parseQuestionsInput(input) {
+  if (Array.isArray(input)) return input;
+  if (typeof input !== 'string') return null;
+  try {
+    return JSON.parse(input);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function cleanupUploadedFiles(files) {
+  if (!files || files.length === 0) return;
+  await Promise.all(files.map((f) => deleteFile(questionAttachmentUrl(f.filename))));
+}
+
+/**
+ * Completa `attachment_url` de cada pregunta ya validada por
+ * validateQuestions (que solo revisó la FORMA del adjunto, sin mirar
+ * archivos): empareja los archivos subidos por multer (`.any()`, nombrados
+ * `question_attachment_<índice>` por el frontend) con su pregunta por
+ * índice, verifica tamaño y firma binaria según el tipo declarado, y arma
+ * la URL final. Si una pregunta image/video NO trae archivo nuevo, se
+ * conserva el `attachment_url` que el cliente ya traía (caso de editar sin
+ * tocar el adjunto — ver updateQuestions).
+ *
+ * No hace cleanup de archivos por su cuenta: el caller decide qué borrar
+ * (ver cleanupUploadedFiles), porque un error acá puede convivir con
+ * archivos de OTRAS preguntas que sí eran válidos y que de todos modos hay
+ * que borrar completos si la petición entera se rechaza.
+ */
+async function resolveQuestionAttachments(questions, files, locale) {
+  const filesByIndex = new Map();
+  for (const file of (files || [])) {
+    const match = /^question_attachment_(\d+)$/.exec(file.fieldname);
+    if (!match) {
+      return { ok: false, message: t(locale, 'errors.unexpected_upload_field') };
+    }
+    filesByIndex.set(Number(match[1]), file);
+  }
+
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    if (!q.attachment_type) {
+      q.attachment_url = null;
+      continue;
+    }
+    if (q.attachment_type === 'url') {
+      q.attachment_url = String(q.attachment_url).trim();
+      continue;
+    }
+
+    const file = filesByIndex.get(i);
+    if (!file) {
+      // Editar sin reemplazar el adjunto: el cliente reenvía la URL que ya
+      // tenía (ver getQuestionsForManage). Sin eso, no hay nada que guardar.
+      if (!q.attachment_url) {
+        return { ok: false, message: t(locale, 'errors.question_attachment_file_required') };
+      }
+      continue;
+    }
+
+    const maxSize = q.attachment_type === 'image' ? MAX_IMAGE_SIZE_BYTES : MAX_VIDEO_SIZE_BYTES;
+    if (file.size > maxSize) {
+      return { ok: false, message: t(locale, 'errors.question_attachment_too_large') };
+    }
+    const signatureOk = await checkFileSignature(file, q.attachment_type);
+    if (!signatureOk) {
+      return { ok: false, message: t(locale, 'errors.file_signature_mismatch') };
+    }
+    q.attachment_url = questionAttachmentUrl(file.filename);
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Crea un content tipo 'quiz' o 'survey' con sus preguntas (y opciones,
+ * cuando aplica). Ver validateQuestions/insertQuestions para las reglas
+ * compartidas con updateQuestions.
+ */
+async function createQuestionContent(req, res, type) {
+  const isQuiz = type === 'quiz';
+  const label = isQuiz ? 'el cuestionario' : 'la encuesta';
+
+  try {
+    const { course_id, title, description, title_en, description_en, folder_id, weight_percent } = req.body;
+    const questions = parseQuestionsInput(req.body.questions);
+
+    if (!course_id || !title) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.course_id_title_required') });
+    }
+
+    const validation = validateQuestions(questions, isQuiz, req.locale);
+    if (!validation.ok) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: validation.message });
+    }
+
+    const weightCheck = parseWeightPercent(isQuiz ? weight_percent : undefined, req.locale);
+    if (!weightCheck.ok) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: weightCheck.message });
+    }
+
+    const folderCheck = await resolveFolderId(folder_id, course_id);
+    if (!folderCheck.ok) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.folder_not_in_course') });
+    }
+
+    // Las preguntas de tipo quiz/survey son nuevas en esta petición (no hay
+    // "adjunto existente" que conservar, a diferencia de updateQuestions):
+    // una pregunta image/video sin archivo nuevo es un error acá.
+    const attachmentCheck = await resolveQuestionAttachments(questions, req.files, req.locale);
+    if (!attachmentCheck.ok) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: attachmentCheck.message });
+    }
+
+    // El content y todas sus preguntas/opciones se crean en una sola
+    // transacción: sin esto, un fallo a mitad del loop (ej. pregunta 3 de
+    // 5) dejaba un quiz/encuesta a medio construir, ya visible para los
+    // estudiantes, mientras el profesor recibía un error de creación
+    // fallida sin ninguna pista de que quedó una fila a medias.
+    const connection = await pool.getConnection();
+    let contentId;
+    try {
+      await connection.beginTransaction();
+
+      contentId = await Content.create({
+        course_id,
+        type,
+        title,
+        description,
+        title_en,
+        description_en,
+        url: null,
+        folder_id: folderCheck.folderId,
+        weight_percent: weightCheck.value
+      }, connection);
+
+      await insertQuestions(contentId, questions, isQuiz, connection);
+
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+    res.status(201).json({
+      success: true,
+      message: isQuiz ? t(req.locale, 'success.quiz_created') : t(req.locale, 'success.survey_created'),
+      data: { id: contentId }
+    });
+  } catch (error) {
+    console.error(`Error al crear ${label}:`, error);
+    // Llegar acá implica que las validaciones (incluida la de adjuntos) ya
+    // pasaron y el archivo quedaría huérfano si el INSERT real falló.
+    await cleanupUploadedFiles(req.files);
+    res.status(500).json({ success: false, message: isQuiz ? t(req.locale, 'errors.add_quiz_failed') : t(req.locale, 'errors.add_survey_failed') });
+  }
+}
+
+export const createQuizContent = (req, res) => createQuestionContent(req, res, 'quiz');
+export const createSurveyContent = (req, res) => createQuestionContent(req, res, 'survey');
+
+/**
+ * Preguntas de un quiz/survey para que el profesor/admin las edite —
+ * siempre con is_correct (a diferencia de getQuestions, pensado para el
+ * estudiante que todavía no respondió) y con `respondent_count`, que el
+ * frontend usa para decidir si ofrece el editor completo o el aviso de
+ * "hay que borrar y crear de nuevo" (ver updateQuestions).
+ */
+export const getQuestionsForManage = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const content = await Content.findById(id);
+
+    if (!content) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.content_not_found') });
+    }
+    if (!['quiz', 'survey'].includes(content.type)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.not_quiz_or_survey') });
+    }
+
+    const [questions, respondentCount] = await Promise.all([
+      ContentQuestion.findByContent(id, { includeCorrect: true }),
+      ContentAnswer.countRespondents(id)
+    ]);
+
+    res.json({
+      success: true,
+      data: { weight_percent: content.weight_percent, questions, respondent_count: respondentCount }
+    });
+  } catch (error) {
+    console.error('Error al obtener las preguntas para editar:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_questions_failed') });
+  }
+};
+
+/**
+ * Reemplaza título/descripción/tipo de pregunta y TODAS las preguntas de un
+ * quiz/survey — solo mientras nadie respondió todavía (ContentQuestion
+ * tiene ON DELETE CASCADE hacia content_question_options y
+ * content_answers, así que borrar las preguntas viejas se llevaría
+ * respuestas reales si las hubiera). Con respondentCount > 0 el frontend
+ * ni siquiera ofrece este formulario, pero se revalida acá también — un
+ * PUT directo no debe poder saltarse la regla.
+ */
+export const updateQuestions = async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const content = await Content.findById(id);
+    if (!content) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.content_not_found') });
+    }
+    if (!['quiz', 'survey'].includes(content.type)) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.not_quiz_or_survey') });
+    }
+
+    const { title, description, title_en, description_en, weight_percent } = req.body;
+    const questions = parseQuestionsInput(req.body.questions);
+    const isQuiz = content.type === 'quiz';
+
+    if (!title || !String(title).trim()) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.title_required') });
+    }
+
+    const validation = validateQuestions(questions, isQuiz, req.locale);
+    if (!validation.ok) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: validation.message });
+    }
+
+    const weightCheck = parseWeightPercent(isQuiz ? weight_percent : undefined, req.locale);
+    if (!weightCheck.ok) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: weightCheck.message });
+    }
+
+    const respondentCount = await ContentAnswer.countRespondents(id);
+    if (respondentCount > 0) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.cannot_edit_questions_has_answers')
+      });
+    }
+
+    // A diferencia de crear: una pregunta image/video sin archivo nuevo es
+    // VÁLIDA acá si trae el attachment_url que ya tenía (el front lo repite
+    // tal cual cuando el profesor no toca el adjunto al editar).
+    const attachmentCheck = await resolveQuestionAttachments(questions, req.files, req.locale);
+    if (!attachmentCheck.ok) {
+      await cleanupUploadedFiles(req.files);
+      return res.status(400).json({ success: false, message: attachmentCheck.message });
+    }
+
+    // Preguntas viejas (con sus adjuntos) ANTES de reemplazarlas — las que
+    // tenían un archivo propio (no 'url') y no sobreviven en el set nuevo
+    // quedan huérfanas en disco si no se borran después del commit.
+    const oldQuestions = await ContentQuestion.findByContent(id);
+
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+
+      await Content.update(id, {
+        title: String(title).trim(),
+        description: description !== undefined ? description : content.description,
+        title_en: title_en !== undefined ? title_en : content.title_en,
+        description_en: description_en !== undefined ? description_en : content.description_en,
+        weight_percent: weightCheck.value
+      }, connection);
+
+      await ContentQuestion.deleteByContent(id, connection);
+      await insertQuestions(id, questions, isQuiz, connection);
+
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      await cleanupUploadedFiles(req.files);
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+    const newAttachmentUrls = new Set(
+      questions.filter((q) => q.attachment_type && q.attachment_type !== 'url').map((q) => q.attachment_url)
+    );
+    const orphanedUrls = oldQuestions
+      .filter((q) => q.attachment_type && q.attachment_type !== 'url' && !newAttachmentUrls.has(q.attachment_url))
+      .map((q) => q.attachment_url);
+    await Promise.all(orphanedUrls.map(deleteFile));
+
+    res.json({
+      success: true,
+      message: isQuiz ? t(req.locale, 'success.quiz_updated') : t(req.locale, 'success.survey_updated')
+    });
+  } catch (error) {
+    console.error('Error al actualizar las preguntas:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.update_questions_failed') });
+  }
+};
+
+/**
+ * Preguntas de un cuestionario/encuesta para que el estudiante responda —
+ * sin `is_correct` en las opciones si todavía no respondió. Si ya
+ * respondió, devuelve también sus respuestas (ahí sí con `is_correct`,
+ * porque ya no hay nada que proteger).
+ */
+export const getQuestions = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const content = await Content.findById(id);
+
+    if (!content) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.content_not_found') });
+    }
+    if (!['quiz', 'survey'].includes(content.type)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.not_quiz_or_survey') });
+    }
+
+    const canAccess = await Course.canAccessMedia(content.course_id, req.session?.user);
+    if (!canAccess) {
+      return res.status(403).json({ success: false, message: t(req.locale, 'errors.quiz_view_access_required') });
+    }
+
+    const userId = req.session.user.id;
+    const alreadyAnswered = await ContentAnswer.hasAnswered(id, userId);
+
+    if (alreadyAnswered) {
+      const [questions, myAnswers] = await Promise.all([
+        ContentQuestion.findByContent(id, { includeCorrect: true }),
+        ContentAnswer.findByContentAndUser(id, userId)
+      ]);
+      return res.json({
+        success: true,
+        data: { already_answered: true, questions, my_answers: myAnswers }
+      });
+    }
+
+    const questions = await ContentQuestion.findByContent(id, { includeCorrect: false });
+    res.json({
+      success: true,
+      data: { already_answered: false, questions }
+    });
+  } catch (error) {
+    console.error('Error al obtener preguntas:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_questions_failed') });
+  }
+};
+
+/**
+ * GET /api/contents/course/:courseId/quiz-status
+ * Estado del usuario en TODOS los cuestionarios/encuestas del curso, en una
+ * sola petición: `{ [contentId]: { already_answered, score, max_score,
+ * pending } }`. Mismo acceso que GET /:id/questions (admin, inscrito o
+ * profesor asignado). Reemplaza el N+1 de pedir /:id/questions por cada
+ * quiz al abrir el detalle del curso.
+ */
+export const getQuizStatusByCourse = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+
+    const canAccess = await Course.canAccessMedia(courseId, req.session?.user);
+    if (!canAccess) {
+      return res.status(403).json({ success: false, message: t(req.locale, 'errors.quiz_view_access_required') });
+    }
+
+    const rows = await ContentAnswer.getStatusByCourse(courseId, req.session.user.id);
+    const status = {};
+    for (const row of rows) {
+      status[row.content_id] = {
+        already_answered: Number(row.answered_count) > 0,
+        score: Number(row.score),
+        max_score: Number(row.max_score),
+        pending: Number(row.pending_count)
+      };
+    }
+
+    res.json({ success: true, data: status });
+  } catch (error) {
+    console.error('Error al obtener el estado de los cuestionarios:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_quiz_status_failed') });
+  }
+};
+
+/**
+ * Envía todas las respuestas de un intento a la vez. `req.quizContent` lo
+ * deja puesto el middleware inline de la ruta (ver content.routes.js,
+ * mismo patrón que req.taskContent en /:id/submit): ya validó que el
+ * content existe, es quiz/survey, y el usuario está inscrito.
+ */
+export const submitAnswers = async (req, res) => {
+  try {
+    const content = req.quizContent;
+    const userId = req.session.user.id;
+    const { answers } = req.body;
+
+    if (!Array.isArray(answers) || answers.length === 0) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.answers_required') });
+    }
+
+    const alreadyAnswered = await ContentAnswer.hasAnswered(content.id, userId);
+    if (alreadyAnswered) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.single_submission_only') });
+    }
+
+    const questions = await ContentQuestion.findByContent(content.id, { includeCorrect: true });
+    if (questions.length === 0) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.no_questions_in_content') });
+    }
+
+    const questionsById = new Map(questions.map((q) => [q.id, q]));
+    const answersByQuestion = new Map(answers.map((a) => [a.question_id, a]));
+    const answersAllQuestions = questions.every((q) => answersByQuestion.has(q.id));
+    if (!answersAllQuestions || answers.length !== questions.length) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.all_questions_required') });
+    }
+
+    const isQuiz = content.type === 'quiz';
+
+    let rows;
+    try {
+      rows = questions.map((question) => {
+        const answer = answersByQuestion.get(question.id);
+        const needsOptions = question.question_type === 'multiple_choice' || question.question_type === 'true_false';
+
+        if (needsOptions) {
+          const option = question.options.find((o) => o.id === answer.option_id);
+          if (!option) {
+            throw Object.assign(new Error(t(req.locale, 'errors.option_not_in_question')), { status: 400 });
+          }
+          return {
+            question_id: question.id,
+            option_id: option.id,
+            answer_text: null,
+            is_correct: isQuiz ? !!option.is_correct : null
+          };
+        }
+
+        // short_answer: en un quiz queda pendiente de revisión manual
+        // (is_correct null hasta que el profesor la califique); en una
+        // encuesta nunca se califica.
+        const answerText = answer.answer_text ? String(answer.answer_text).trim() : '';
+        // Sin esto, un texto de más de 65535 bytes UTF-8 (el límite real
+        // de la columna TEXT) llegaba hasta el INSERT y MySQL lo
+        // rechazaba con ER_DATA_TOO_LONG — un 500 genérico en vez de un
+        // 400 que diga qué pasó, mismo criterio que question_text/option_text.
+        if (exceedsFieldLimit('answer_text', answerText)) {
+          throw Object.assign(new Error(t(req.locale, 'errors.answer_text_too_long')), { status: 400 });
+        }
+        return {
+          question_id: question.id,
+          option_id: null,
+          answer_text: answerText,
+          is_correct: null
+        };
+      });
+    } catch (validationError) {
+      if (validationError.status === 400) {
+        return res.status(400).json({ success: false, message: validationError.message });
+      }
+      throw validationError;
+    }
+
+    const inserted = await ContentAnswer.submitAnswers(content.id, userId, rows);
+    if (inserted === null) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.single_submission_only') });
+    }
+
+    await Content.markCompleted(content.id, userId);
+    const { progress, total, completed, enrollment_course_id } = await Content.recalculateCourseProgress(content.course_id, userId);
+
+    const data = { progress, total, completed, enrollment_course_id };
+    if (isQuiz) {
+      // El puntaje pondera por los puntos de cada pregunta (ver
+      // ContentQuestion.points), no por cantidad de preguntas correctas —
+      // una pregunta más difícil marcada con más puntos pesa más en el
+      // resultado final.
+      const pointsByQuestion = new Map(questions.map((q) => [q.id, q.points || 1]));
+      data.score = rows
+        .filter((r) => r.is_correct === true)
+        .reduce((sum, r) => sum + (pointsByQuestion.get(r.question_id) || 1), 0);
+      data.max_score = questions.reduce((sum, q) => sum + (q.points || 1), 0);
+      data.total_questions = rows.length;
+      data.pending_review = rows.filter((r) => r.is_correct === null).length;
+      data.results = rows.map((r) => ({
+        question_id: r.question_id,
+        is_correct: r.is_correct,
+        points: pointsByQuestion.get(r.question_id) || 1
+      }));
+    }
+
+    res.status(201).json({
+      success: true,
+      message: isQuiz ? t(req.locale, 'success.quiz_submitted') : t(req.locale, 'success.survey_thanks'),
+      data
+    });
+  } catch (error) {
+    console.error('Error al enviar respuestas:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.submit_answers_failed') });
+  }
+};
+
+/**
+ * Resultados para el profesor/admin. Un quiz muestra correctas/incorrectas
+ * por pregunta (y respuestas cortas pendientes de calificar); una encuesta
+ * muestra conteos agregados por opción (y respuestas abiertas, sin
+ * calificar — una encuesta no tiene "correcto").
+ */
+export const getResults = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const content = await Content.findById(id);
+
+    if (!content) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.content_not_found') });
+    }
+    if (!['quiz', 'survey'].includes(content.type)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.not_quiz_or_survey') });
+    }
+
+    const [questions, answers] = await Promise.all([
+      ContentQuestion.findByContent(id, { includeCorrect: true }),
+      ContentAnswer.findAllByContent(id)
+    ]);
+
+    const totalRespondents = new Set(answers.map((a) => a.user_id)).size;
+    const isQuiz = content.type === 'quiz';
+
+    // Se agrupa UNA vez por pregunta: filtrar el arreglo completo por cada
+    // pregunta era O(preguntas x respuestas) (300 x 45.000 en el quiz grande).
+    const answersByQuestion = new Map();
+    for (const answer of answers) {
+      if (!answersByQuestion.has(answer.question_id)) answersByQuestion.set(answer.question_id, []);
+      answersByQuestion.get(answer.question_id).push(answer);
+    }
+
+    const questionResults = questions.map((q) => {
+      const questionAnswers = answersByQuestion.get(q.id) || [];
+
+      if (q.question_type === 'short_answer') {
+        return {
+          question_id: q.id,
+          question_text: q.question_text,
+          question_type: q.question_type,
+          attachment_type: q.attachment_type,
+          attachment_url: q.attachment_url,
+          points: q.points,
+          // `answers` trae solo las primeras RESULTS_INLINE_SHORT_ANSWERS;
+          // `answers_total` dice cuántas hay en total (las demás se piden
+          // con GET /:id/questions/:questionId/answers).
+          answers_total: questionAnswers.length,
+          answers: questionAnswers.slice(0, RESULTS_INLINE_SHORT_ANSWERS).map((a) => ({
+            answer_id: a.id,
+            student_name: a.student_name,
+            student_email: a.student_email,
+            answer_text: a.answer_text,
+            is_correct: isQuiz ? a.is_correct : undefined,
+            submitted_at: a.submitted_at
+          }))
+        };
+      }
+
+      if (isQuiz) {
+        const correctCount = questionAnswers.filter((a) => a.is_correct == 1).length;
+        return {
+          question_id: q.id,
+          question_text: q.question_text,
+          question_type: q.question_type,
+          attachment_type: q.attachment_type,
+          attachment_url: q.attachment_url,
+          points: q.points,
+          correct_count: correctCount,
+          incorrect_count: questionAnswers.length - correctCount
+        };
+      }
+
+      // Encuesta de opción múltiple/verdadero-falso: conteo + porcentaje
+      // por opción.
+      const options = q.options.map((o) => {
+        const count = questionAnswers.filter((a) => a.option_id === o.id).length;
+        const percent = questionAnswers.length > 0 ? Math.round((count / questionAnswers.length) * 100) : 0;
+        return { option_id: o.id, option_text: o.option_text, count, percent };
+      });
+      return { question_id: q.id, question_text: q.question_text, question_type: q.question_type, attachment_type: q.attachment_type, attachment_url: q.attachment_url, options };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        type: content.type,
+        total_respondents: totalRespondents,
+        questions: questionResults
+      }
+    });
+  } catch (error) {
+    console.error('Error al obtener resultados:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_results_failed') });
+  }
+};
+
+/**
+ * GET /api/contents/:id/questions/:questionId/answers
+ * Una página (?page, ?limit) de las respuestas de una pregunta de
+ * respuesta corta — el resto de las que /results ya no manda completas (ver
+ * RESULTS_INLINE_SHORT_ANSWERS). Mismo acceso que /results: admin, o el
+ * profesor asignado al curso. Cada respuesta tiene el mismo formato que en
+ * /results.
+ */
+export const getShortAnswers = async (req, res) => {
+  try {
+    const { id, questionId } = req.params;
+
+    const content = await Content.findById(id);
+    if (!content) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.content_not_found') });
+    }
+    if (!['quiz', 'survey'].includes(content.type)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.not_quiz_or_survey') });
+    }
+
+    const question = await ContentQuestion.findById(questionId);
+    if (!question || question.content_id !== content.id) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.question_not_found') });
+    }
+    if (question.question_type !== 'short_answer') {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.not_short_answer_question') });
+    }
+
+    const { page, limit } = parsePagination(req.query, RESULTS_INLINE_SHORT_ANSWERS);
+    const [rows, total] = await Promise.all([
+      ContentAnswer.findPageByQuestion(question.id, { page, limit }),
+      ContentAnswer.countByQuestion(question.id)
+    ]);
+
+    const isQuiz = content.type === 'quiz';
+    res.json({
+      success: true,
+      data: {
+        answers: rows.map((a) => ({
+          answer_id: a.id,
+          student_name: a.student_name,
+          student_email: a.student_email,
+          answer_text: a.answer_text,
+          is_correct: isQuiz ? a.is_correct : undefined,
+          submitted_at: a.submitted_at
+        }))
+      },
+      pagination: buildPagination(page, limit, total)
+    });
+  } catch (error) {
+    console.error('Error al obtener las respuestas de la pregunta:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_results_failed') });
+  }
+};
+
+/**
+ * Calificación manual de una respuesta de tipo short_answer (multiple_choice
+ * / true_false ya se autocalificaron al enviar). Solo tiene sentido para
+ * quiz — una encuesta nunca se califica, pero no hace falta bloquearlo acá:
+ * el frontend simplemente no ofrece el botón de calificar en encuestas.
+ */
+export const gradeAnswer = async (req, res) => {
+  try {
+    const { answerId } = req.params;
+    const { is_correct } = req.body;
+
+    if (typeof is_correct !== 'boolean') {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.is_correct_boolean_required') });
+    }
+
+    const updated = await ContentAnswer.gradeAnswer(answerId, is_correct);
+    if (!updated) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.answer_not_found') });
+    }
+
+    res.json({ success: true, message: t(req.locale, 'success.answer_graded') });
+  } catch (error) {
+    console.error('Error al calificar respuesta:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.grade_answer_failed') });
+  }
+};

@@ -1,0 +1,385 @@
+import express from 'express';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import cookieParser from 'cookie-parser';
+import session from 'express-session';
+import expressMySQLSession from 'express-mysql-session';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import pool from './config/db.js';
+import { UPLOADS_ROOT } from './config/uploads.js';
+import { resolveLocale } from './middlewares/i18n.middleware.js';
+import { handleBodyParserError } from './middlewares/bodyParserError.middleware.js';
+import { t } from './utils/i18n.js';
+
+const MySQLStore = expressMySQLSession(session);
+
+// Routes
+import authRoutes from './routes/auth.routes.js';
+import courseRoutes from './routes/course.routes.js';
+import courseModuleRoutes from './routes/courseModule.routes.js';
+import contentRoutes from './routes/content.routes.js';
+import userRoutes from './routes/user.routes.js';
+import submissionRoutes from './routes/submission.routes.js';
+import forumRoutes from './routes/forum.routes.js';
+import settingsRoutes from './routes/settings.routes.js';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Solo confiar en X-Forwarded-For/-Proto si el propio despliegue corre
+// detrás de un proxy real (nginx, IIS, un balanceador). Confiarlo a ciegas
+// permitiría a cualquier cliente falsificar su IP y saltarse el rate
+// limiting por IP; no configurarlo cuando SÍ hay un proxy real de por
+// medio hace que todos los usuarios reales compartan una sola IP (la del
+// proxy) a ojos de Express. Por eso queda apagado por defecto (mismo
+// comportamiento que ya había) y solo se activa si se declara
+// explícitamente en el .env de ese despliegue en particular.
+if (process.env.TRUST_PROXY) {
+  const raw = process.env.TRUST_PROXY.trim();
+  // Mismo criterio de fail-fast que SESSION_SECRET más abajo: un valor mal
+  // tipeado acá cambia en silencio una configuración sensible a spoofing
+  // de IP (ver el comentario de arriba) — mejor frenar el arranque con un
+  // mensaje claro que dejarlo pasar sin que nadie lo note. Formas válidas
+  // para Express: boolean, número de hops, palabra clave reservada, o una
+  // IP/CIDR (o lista de ellas separadas por coma).
+  const TRUST_PROXY_KEYWORDS = ['loopback', 'linklocal', 'uniquelocal'];
+  const isValid =
+    raw === 'true' || raw === 'false' ||
+    /^\d+$/.test(raw) ||
+    TRUST_PROXY_KEYWORDS.includes(raw) ||
+    /^[0-9a-fA-F:.\/,\s-]+$/.test(raw);
+
+  if (!isValid) {
+    console.error(`❌ TRUST_PROXY="${raw}" no es un valor válido para Express (boolean, número de saltos, IP/CIDR, o una de ${TRUST_PROXY_KEYWORDS.join('/')}). Revisa tu archivo .env.`);
+    process.exit(1);
+  }
+
+  app.set('trust proxy', raw === 'true' ? true : raw === 'false' ? false : /^\d+$/.test(raw) ? Number(raw) : raw);
+}
+
+// =============================================
+// Middlewares
+// =============================================
+
+// Cabeceras HTTP de seguridad (anti-clickjacking, anti-sniffing de MIME,
+// desactiva X-Powered-By, etc.). La CSP se arma a mano en vez de con los
+// defaults de Helmet (script-src/style-src 'self') porque el frontend
+// usa atributos onclick inline en el HTML e incrusta reproductores de
+// YouTube/Vimeo — se permite puntualmente cada uno de esos orígenes en
+// vez de desactivar la CSP por completo. Tailwind (compilado, ver
+// "build:css") y Font Awesome (/vendor/fontawesome) se sirven desde el
+// propio servidor: no hay ningún CDN externo permitido.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", 'https://www.youtube.com'],
+      // Helmet desactiva esto por defecto (script-src-attr 'none'), pero
+      // el frontend depende en TODAS partes de atributos onclick="..."
+      // inline (no hay build step que los reemplace por addEventListener).
+      scriptSrcAttr: ["'unsafe-inline'"],
+      // Font Awesome ahora se sirve desde /vendor/fontawesome (ya no cdnjs),
+      // así que la política deja de permitir hojas de estilo y fuentes de
+      // terceros: menos superficie y sin dependencia de un CDN externo.
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      fontSrc: ["'self'", 'data:'],
+      // 'blob:' es necesario para la previsualización local de una imagen
+      // antes de subirla (URL.createObjectURL en el adjunto de una
+      // pregunta de quiz/encuesta, ver views_content_manager.js) — mismo
+      // motivo que mediaSrc ya lo permite para video.
+      imgSrc: ["'self'", 'data:', 'blob:'],
+      // 'blob:' es necesario para la previsualización local del video antes
+      // de subirlo (URL.createObjectURL en el formulario de agregar video).
+      mediaSrc: ["'self'", 'blob:'],
+      connectSrc: ["'self'"],
+      frameSrc: ['https://www.youtube.com', 'https://player.vimeo.com'],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"]
+    }
+  }
+}));
+
+// Log de peticiones HTTP: formato compacto y coloreado en desarrollo,
+// formato "combined" (estilo Apache, con IP y user-agent) en producción,
+// más útil para revisar logs de un servidor real.
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+
+// Body parser
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Cookie parser
+app.use(cookieParser());
+
+// La app no debe arrancar si falta el secret de sesión: sin esto, el
+// fallback anterior era un secreto público hardcodeado en el código.
+if (!process.env.SESSION_SECRET) {
+  console.error('❌ Falta la variable de entorno SESSION_SECRET. Revisa tu archivo .env');
+  process.exit(1);
+}
+
+// Session store en MySQL: usa el mismo pool que ya existe.
+// Reemplaza a MemoryStore, que express-session marca como NO apta para
+// producción (fuga de memoria y pérdida de sesiones al reiniciar).
+const sessionStore = new MySQLStore({
+  createDatabaseTable: true,
+  schema: {
+    tableName: 'sessions',
+    columnNames: {
+      session_id: 'session_id',
+      expires: 'expires',
+      data: 'data'
+    }
+  }
+}, pool);
+
+sessionStore.on('error', (error) => {
+  console.error('❌ Error en el session store de MySQL:', error);
+});
+
+// Session configuration
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  store: sessionStore,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    maxAge: 1000 * 60 * 60 * 24, // 24 horas
+    httpOnly: true, // no accesible desde JS en el navegador (mitiga robo de cookie vía XSS)
+    secure: process.env.NODE_ENV === 'production', // solo por HTTPS en producción
+    sameSite: 'lax' // mitiga CSRF básico
+  }
+}));
+
+// Archivos estáticos (HTML, CSS, JS)
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Videos y thumbnails se sirven directo como estáticos (necesario para
+// streaming eficiente con <video> y para las miniaturas del catálogo).
+// Los ARCHIVOS DESCARGABLES ('uploads/files') NO se sirven aquí a propósito:
+// deben pasar siempre por GET /api/contents/:id/download, que valida
+// autenticación e inscripción al curso antes de entregar el archivo.
+app.use('/uploads/videos', express.static(path.join(UPLOADS_ROOT, 'videos')));
+app.use('/uploads/thumbnails', express.static(path.join(UPLOADS_ROOT, 'thumbnails')));
+app.use('/uploads/content-images', express.static(path.join(UPLOADS_ROOT, 'content-images')));
+app.use('/uploads/avatars', express.static(path.join(UPLOADS_ROOT, 'avatars')));
+// Fondos de login/catálogo subidos desde Apariencia del Sitio (ver
+// settings.controller.js) — faltaba este mount: la URL guardada en BD
+// nunca servía la imagen real, caía en el catch-all de la SPA de abajo.
+app.use('/uploads/site', express.static(path.join(UPLOADS_ROOT, 'site')));
+// Adjuntos de pregunta de quiz/encuesta (imagen o video, ver
+// quiz.controller.js) — mismo criterio que content-images/videos: se
+// muestran directo en la pregunta, no son un archivo descargable protegido.
+app.use('/uploads/question-attachments', express.static(path.join(UPLOADS_ROOT, 'question-attachments')));
+
+// =============================================
+// API Routes
+// =============================================
+
+/**
+ * GET /health — para que un balanceador/gestor de procesos (o simplemente
+ * curl) pueda saber si el proceso está vivo, sin depender de que algún
+ * endpoint de negocio responda 200.
+ */
+app.get('/health', (req, res) => {
+  res.json({ success: true, status: 'ok' });
+});
+
+// Resuelve req.locale para toda ruta /api/* — leído por los controllers ya
+// traducidos (ver src/utils/i18n.js) al armar el `message` de la respuesta.
+app.use('/api', resolveLocale);
+
+app.use('/api/auth', authRoutes);
+app.use('/api/courses', courseRoutes);
+app.use('/api/course-modules', courseModuleRoutes);
+app.use('/api/contents', contentRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/submissions', submissionRoutes);
+app.use('/api/forum-posts', forumRoutes);
+app.use('/api/settings', settingsRoutes);
+
+// Una ruta /api/* que no matcheó ningún router de arriba (typo, endpoint
+// viejo, etc.) debe responder 404 JSON — sin esto caía en el catch-all de
+// la SPA de abajo y devolvía el index.html con status 200, y el
+// `fetch(...).json()` del cliente fallaba con un confuso "Unexpected
+// token '<'" en vez de un 404 claro.
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, message: t(req.locale, 'errors.endpoint_not_found') });
+});
+
+// =============================================
+// SPA - Todas las rutas devuelven index.html
+// =============================================
+
+app.get('/*splat', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// =============================================
+// Error handling middleware
+// =============================================
+
+// Errores de los body parsers (JSON demasiado grande o mal formado): sin
+// esto el handler genérico de abajo respondía el mensaje crudo en inglés.
+app.use(handleBodyParserError);
+
+// Manejo específico de errores de Multer (archivo muy grande, campo de
+// archivo inesperado, etc.). Sin esto, estos errores caían en el handler
+// genérico de abajo y respondían 500 (error de servidor) cuando en
+// realidad son errores del cliente (400): el archivo no cumple los límites.
+app.use((err, req, res, next) => {
+  if (err && err.name === 'MulterError') {
+    // Los 7 códigos que define multer — antes solo se traducían los 2 que
+    // disparan las rutas actuales; el resto caía al err.message crudo de
+    // multer (en inglés, sin pasar por t()) si algún día se agrega un
+    // .fields() con maxCount en algún lado.
+    const messages = {
+      LIMIT_FILE_SIZE: t(req.locale, 'errors.multer_file_too_large'),
+      LIMIT_UNEXPECTED_FILE: t(req.locale, 'errors.multer_unexpected_field'),
+      LIMIT_FILE_COUNT: t(req.locale, 'errors.multer_too_many_files'),
+      LIMIT_PART_COUNT: t(req.locale, 'errors.multer_too_many_parts'),
+      LIMIT_FIELD_COUNT: t(req.locale, 'errors.multer_too_many_fields'),
+      LIMIT_FIELD_KEY: t(req.locale, 'errors.multer_field_name_too_long'),
+      LIMIT_FIELD_VALUE: t(req.locale, 'errors.multer_field_value_too_long')
+    };
+    return res.status(400).json({
+      success: false,
+      message: messages[err.code] || err.message
+    });
+  }
+  next(err);
+});
+
+// Handler genérico: siempre se registra el detalle completo en el log del
+// servidor, pero al cliente solo se le manda el mensaje interno si estamos
+// en desarrollo. En producción, un mensaje genérico evita filtrar detalles
+// internos (rutas, mensajes de MySQL, stack traces, etc.) a quien sea que
+// esté viendo la respuesta.
+app.use((err, req, res, next) => {
+  console.error('❌ Error:', err);
+
+  const status = err.status || 500;
+  const isDev = process.env.NODE_ENV !== 'production';
+  // Los errores 4xx (validaciones, tipo de archivo no permitido, etc.) son
+  // intencionales y su mensaje es información útil para el usuario, no un
+  // detalle interno — se muestran siempre. Solo los 500 reales (errores
+  // inesperados: MySQL, bugs, etc.) se ocultan en producción para no
+  // filtrar detalles internos del servidor.
+  const message = (status < 500 || isDev)
+    ? (err.message || t(req.locale, 'errors.internal_server_error'))
+    : t(req.locale, 'errors.internal_server_error_retry');
+
+  res.status(status).json({
+    success: false,
+    message
+  });
+});
+
+// =============================================
+// Verificar conexión a la base de datos
+// =============================================
+
+const testDB = async () => {
+  try {
+    const [rows] = await pool.query('SELECT 1');
+    console.log('✅ Conectado a la base de datos MySQL');
+  } catch (error) {
+    console.error('❌ Error de conexión a la base de datos:', error.message);
+    process.exit(1);
+  }
+};
+
+// =============================================
+// Iniciar servidor
+// =============================================
+
+const startServer = async () => {
+  await testDB();
+
+  const server = app.listen(PORT, () => {
+    console.log('\n🚀 ================================');
+    console.log(`🚀 Servidor LMS LANBA - CeNAT corriendo`);
+    console.log(`🚀 URL: http://localhost:${PORT}`);
+    console.log('🚀 ================================\n');
+  });
+
+  // Con el límite de video en 2GB (ver upload.middleware.js), una subida en
+  // una red lenta puede tardar bastante más que los 5 minutos por defecto
+  // de Node para requestTimeout — sin este ajuste, el servidor cortaba la
+  // conexión a medio subir. No se deja en 0 (sin límite): eso abriría la
+  // puerta a conexiones colgadas indefinidamente (riesgo tipo slow-loris).
+  server.requestTimeout = 60 * 60 * 1000; // 60 minutos
+  server.headersTimeout = 65 * 1000; // los headers sí deben llegar rápido
+
+  setupGracefulShutdown(server);
+};
+
+// =============================================
+// Apagado controlado
+// =============================================
+
+/**
+ * Al recibir SIGTERM/SIGINT (ej. `docker stop`, un gestor de procesos
+ * reiniciando el servicio, o Ctrl+C), deja de aceptar conexiones nuevas y
+ * cierra el pool de MySQL recién después de que las conexiones en curso
+ * terminen — sin esto, un restart/deploy a mitad de una subida de 2GB
+ * (ver MAX_VIDEO_SIZE_BYTES) podía cortarla a la mitad y/o dejar
+ * conexiones de MySQL abandonadas en vez de liberadas ordenadamente.
+ */
+function setupGracefulShutdown(server) {
+  let shuttingDown = false;
+
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n🛑 ${signal} recibido, cerrando el servidor...`);
+
+    server.close(async () => {
+      try {
+        await pool.end();
+        console.log('✅ Servidor y pool de MySQL cerrados correctamente');
+        process.exit(0);
+      } catch (error) {
+        console.error('❌ Error al cerrar el pool de MySQL:', error);
+        process.exit(1);
+      }
+    });
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+// =============================================
+// Errores no capturados a nivel de proceso
+// =============================================
+// Sin esto, un error fuera de un try/catch (por ejemplo en un callback o
+// una promesa sin manejar) podía tumbar el servidor completo en silencio,
+// afectando a TODOS los usuarios conectados a la vez, sin ningún log claro
+// de qué pasó.
+
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Promesa rechazada sin manejar:', reason);
+  // No se cierra el proceso: se registra para diagnóstico y el servidor
+  // sigue atendiendo al resto de usuarios.
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Excepción no capturada:', error);
+  // Aquí sí es más seguro cerrar el proceso (el estado interno de Node ya
+  // no es confiable tras una excepción no capturada). Con nodemon en
+  // desarrollo, o un gestor de procesos como PM2 en producción, el
+  // servidor se reinicia automáticamente.
+  process.exit(1);
+});
+
+startServer();
+
+export default app;

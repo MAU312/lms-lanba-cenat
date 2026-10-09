@@ -1,0 +1,1409 @@
+/**
+ * Utilidades generales para el frontend
+ */
+
+// =================================
+// Toast Notifications
+// =================================
+
+// Si dos toasts se muestran en menos de 3s (frecuente: un error de red
+// seguido de un segundo error), sin esto el setTimeout del primero ocultaba
+// el del segundo antes de que cumpliera sus propios 3 segundos.
+let toastHideTimer = null;
+
+// Cuánto se queda visible un aviso. Los de error/advertencia dicen qué salió
+// mal y qué hacer, así que hay que poder LEERLOS con calma (antes todos
+// duraban 3 s fijos, poco para un mensaje de dos líneas); y uno largo
+// necesita más tiempo que uno corto. Pasar el mouse por encima o enfocarlo
+// lo pausa (ver setupToastPause).
+function toastDurationMs(message, type) {
+    const base = (type === 'error' || type === 'warning') ? 7000 : 4000;
+    const extra = Math.min(4000, Math.max(0, String(message).length - 40) * 60);
+    return base + extra;
+}
+
+function showToast(message, type = 'info') {
+    const toast = document.getElementById('toast');
+    const toastIcon = document.getElementById('toast-icon');
+    const toastMessage = document.getElementById('toast-message');
+
+    const config = {
+        success: { icon: 'fa-check-circle text-green-500', class: 'toast-success' },
+        error:   { icon: 'fa-times-circle text-red-500',   class: 'toast-error' },
+        warning: { icon: 'fa-exclamation-circle text-yellow-500', class: 'toast-warning' },
+        info:    { icon: 'fa-info-circle text-blue-500',   class: 'toast-info' }
+    };
+
+    const { icon, class: toastClass } = config[type] || config.info;
+
+    toastIcon.className = `fas ${icon} text-2xl`;
+    toastMessage.textContent = message;
+
+    // Lectores de pantalla: un error/advertencia se anuncia de inmediato
+    // (role="alert"), un aviso de éxito/info espera su turno (role="status").
+    // Se define ANTES de mostrarlo: el anuncio ocurre cuando el elemento
+    // aparece con su rol ya puesto.
+    const urgent = type === 'error' || type === 'warning';
+    toast.setAttribute('role', urgent ? 'alert' : 'status');
+    toast.setAttribute('aria-live', urgent ? 'assertive' : 'polite');
+
+    toast.className = `fixed top-4 right-4 z-50 max-w-sm ${toastClass}`;
+    toast.classList.remove('hidden');
+    toast.classList.add('fade-in');
+
+    if (toastHideTimer) clearTimeout(toastHideTimer);
+    toastHideTimer = setTimeout(() => { hideToast(); }, toastDurationMs(message, type));
+}
+
+function hideToast() {
+    const toast = document.getElementById('toast');
+    toast.classList.add('hidden');
+}
+
+// Mientras el mouse está encima (o el foco está dentro) del aviso no se
+// oculta solo; al salir se le da un margen corto para terminar de leerlo.
+function setupToastPause() {
+    const toast = document.getElementById('toast');
+    if (!toast) return;
+    const pause = () => { if (toastHideTimer) clearTimeout(toastHideTimer); };
+    const resume = () => {
+        if (toast.classList.contains('hidden')) return;
+        if (toastHideTimer) clearTimeout(toastHideTimer);
+        toastHideTimer = setTimeout(() => { hideToast(); }, 2500);
+    };
+    toast.addEventListener('mouseenter', pause);
+    toast.addEventListener('mouseleave', resume);
+    toast.addEventListener('focusin', pause);
+    toast.addEventListener('focusout', resume);
+}
+document.addEventListener('DOMContentLoaded', setupToastPause);
+
+// =================================
+// Accesibilidad: anuncios y movimiento reducido
+// =================================
+
+/**
+ * Anuncia un mensaje a los lectores de pantalla sin mostrarlo (región
+ * aria-live de index.html). Sirve para cambios que un usuario que ve la
+ * pantalla nota solo, pero que en silencio no le llegan al que no: p. ej.
+ * "3 resultados" después de filtrar una lista. El texto se vacía y se vuelve
+ * a escribir en el siguiente ciclo porque, si el mensaje es idéntico al
+ * anterior, el lector no lo repite.
+ */
+function announce(message) {
+    const region = document.getElementById('a11y-announcer');
+    if (!region) return;
+    region.textContent = '';
+    setTimeout(() => { region.textContent = message; }, 60);
+}
+
+// Preferencia del sistema operativo: menos animación/desplazamiento suave
+// (vestibular, epilepsia fotosensible...). El CSS la respeta con la misma
+// media query (ver styles.css); esto es para lo que se anima desde JS.
+function prefersReducedMotion() {
+    return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+// =================================
+// Loading Spinner
+// =================================
+
+function showLoading(elementId = 'app') {
+    const element = document.getElementById(elementId);
+    if (!element) return;
+    element.innerHTML = `
+        <div class="flex items-center justify-center min-h-screen">
+            <div class="text-center">
+                <div class="spinner mx-auto"></div>
+                <p class="mt-4 text-gray-600 dark:text-slate-400">${t('common.loading')}</p>
+            </div>
+        </div>
+    `;
+}
+
+// =================================
+// Format Utilities
+// =================================
+
+// 'es-ES'/'en-US' nada más — no hay una variante por país que importe acá,
+// solo separa el formato de fecha/hora según el idioma elegido (ver
+// i18n.js).
+function dateLocaleTag() {
+    return getLocale() === 'en' ? 'en-US' : 'es-ES';
+}
+
+function formatDate(dateString) {
+    if (!dateString) return '';
+    const options = { year: 'numeric', month: 'long', day: 'numeric' };
+    return new Date(dateString).toLocaleDateString(dateLocaleTag(), options);
+}
+
+/**
+ * Igual que formatDate pero agregando la hora — para casos donde saber
+ * solo el día no alcanza (ej. a qué hora entregó una tarea un estudiante).
+ */
+function formatDateTime(dateString) {
+    if (!dateString) return '';
+    const options = { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+    return new Date(dateString).toLocaleString(dateLocaleTag(), options);
+}
+
+/**
+ * Chequea el tamaño de un archivo ANTES de subirlo. Sin esto, un archivo
+ * que excede el límite del servidor (ver upload.middleware.js) empezaba a
+ * subirse igual — a veces varios minutos, si es un video grande en una
+ * red lenta — y recién fallaba al terminar, cuando Multer lo rechazaba.
+ * Devuelve true si está dentro del límite; si no, muestra un toast con el
+ * límite en un formato legible y devuelve false (el caller debe cancelar
+ * el envío).
+ */
+function checkFileSize(file, maxBytes, label = 'El archivo') {
+    if (file.size <= maxBytes) return true;
+    showToast(t('errors.file_too_large', { label, size: formatFileSize(maxBytes) }), 'error');
+    return false;
+}
+
+/**
+ * Zona de drag&drop + preview en vivo (antes de subir) para un campo de
+ * imagen de portada — compartida por Crear Curso, Editar Curso, y crear un
+ * curso dentro de un módulo (ver showAddModuleCourseForm en
+ * views_content_manager.js). Los defaults son los IDs que ya usaba Crear
+ * Curso antes de generalizar esta función (así su llamada sin argumentos
+ * sigue funcionando igual); Editar Curso y el formulario de módulo pasan
+ * sus propios IDs (este último escopeados por moduleId, para no chocar si
+ * hubiera más de un formulario de este tipo en la misma página).
+ */
+function setupThumbnailDropZone({ dropZoneId = 'thumbnail-drop-zone', inputId = 'thumbnail', previewContainerId = 'thumbnail-preview', previewImgId = 'thumbnail-preview-img' } = {}) {
+    const dropZone = document.getElementById(dropZoneId);
+    const fileInput = document.getElementById(inputId);
+    const preview = document.getElementById(previewContainerId);
+    const previewImg = document.getElementById(previewImgId);
+
+    if (!dropZone || !fileInput) return;
+
+    // La zona era un <div> con solo un click: un usuario de teclado no podía
+    // elegir una portada (el <input type=file> real está oculto). Como botón
+    // enfocable, Enter/Espacio abren el selector de archivos igual que el
+    // clic; su nombre accesible es el texto que ya contiene.
+    dropZone.setAttribute('role', 'button');
+    dropZone.setAttribute('tabindex', '0');
+    dropZone.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            fileInput.click();
+        }
+    });
+
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.classList.add('dragging');
+    });
+
+    dropZone.addEventListener('dragleave', () => {
+        dropZone.classList.remove('dragging');
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('dragging');
+        if (e.dataTransfer.files.length > 0) {
+            fileInput.files = e.dataTransfer.files;
+            showThumbnailPreview(e.dataTransfer.files[0]);
+        }
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            showThumbnailPreview(e.target.files[0]);
+        }
+    });
+
+    function showThumbnailPreview(file) {
+        // La vista previa aparece en silencio: sin esto, quien no ve la
+        // pantalla no se entera de que su selección se registró.
+        announce(t('common.file_selected', { name: file.name }));
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            previewImg.src = e.target.result;
+            preview.classList.remove('hidden');
+        };
+        reader.readAsDataURL(file);
+    }
+}
+window.setupThumbnailDropZone = setupThumbnailDropZone;
+
+function formatFileSize(bytes) {
+    if (!bytes || bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+}
+
+function formatDuration(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+    if (hours > 0) {
+        return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+// =================================
+// Validation
+// =================================
+
+function isValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function validateForm(formId) {
+    const form = document.getElementById(formId);
+    if (!form) return false;
+    const inputs = form.querySelectorAll('input[required], textarea[required], select[required]');
+    let isValid = true;
+    inputs.forEach(input => {
+        if (!input.value.trim()) {
+            input.classList.add('border-red-500');
+            isValid = false;
+        } else {
+            input.classList.remove('border-red-500');
+        }
+    });
+    return isValid;
+}
+
+// =================================
+// Errores de campo (junto al campo, no solo un toast)
+// =================================
+
+/**
+ * Muestra un error de validación DEBAJO del campo que lo causó, en vez de
+ * solo un toast que desaparece: se ve cuál campo hay que corregir, y un
+ * lector de pantalla lo asocia al campo (aria-invalid + aria-describedby)
+ * cuando el foco llega ahí. Se quita solo en cuanto el usuario vuelve a
+ * escribir en ese campo. El llamador debe enfocar el primer campo inválido.
+ */
+function showFieldError(input, message) {
+    if (!input) return;
+    clearFieldError(input);
+
+    const errorId = `${input.id || 'field'}-error`;
+    const error = document.createElement('p');
+    error.id = errorId;
+    error.className = 'field-error mt-1 text-sm font-medium';
+    error.textContent = message;
+
+    // Los campos de las páginas de acceso viven dentro de un div.relative
+    // (ícono a la izquierda / botón de mostrar contraseña): el error va
+    // debajo de ese contenedor, no dentro.
+    const anchor = input.parentElement && input.parentElement.classList.contains('relative') ? input.parentElement : input;
+    anchor.insertAdjacentElement('afterend', error);
+
+    input.dataset.prevDescribedby = input.getAttribute('aria-describedby') || '';
+    input.setAttribute('aria-invalid', 'true');
+    input.setAttribute('aria-describedby', `${input.dataset.prevDescribedby} ${errorId}`.trim());
+    input.addEventListener('input', () => clearFieldError(input), { once: true });
+}
+
+function clearFieldError(input) {
+    if (!input) return;
+    const error = document.getElementById(`${input.id || 'field'}-error`);
+    if (error) error.remove();
+    input.removeAttribute('aria-invalid');
+    if (input.dataset.prevDescribedby !== undefined) {
+        if (input.dataset.prevDescribedby) input.setAttribute('aria-describedby', input.dataset.prevDescribedby);
+        else input.removeAttribute('aria-describedby');
+        delete input.dataset.prevDescribedby;
+    }
+}
+
+// =================================
+// DOM Utilities
+// =================================
+
+function createElementFromHTML(htmlString) {
+    const div = document.createElement('div');
+    div.innerHTML = htmlString.trim();
+    return div.firstChild;
+}
+
+function scrollToElement(elementId) {
+    const element = document.getElementById(elementId);
+    if (element) element.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' });
+}
+
+// =================================
+// Asociar cada <label> con su control
+// =================================
+
+let autoFieldIdCounter = 0;
+
+/**
+ * Muchos formularios (sobre todo el gestor de contenido: ~40 casos) escriben
+ * `<label>Título</label><input ...>` como HERMANOS, sin `for` ni envolver el
+ * control. Para un lector de pantalla ese campo queda SIN nombre, y hacer
+ * clic en el texto de la etiqueta no lo enfoca. En vez de editar cada
+ * plantilla, esto empareja cada <label> sin `for` con el primer control que
+ * le sigue (entre sus hermanos siguientes o dentro de ellos, hasta llegar a
+ * la próxima <label>); un control sin id recibe uno generado.
+ * No toca: labels que ya tienen `for` o que envuelven su control, controles
+ * que ya tienen aria-label/aria-labelledby (ese nombre explícito manda), ni
+ * inputs `hidden` / file ocultos (ahí el "control" real es la zona de
+ * arrastre, que no es un campo de formulario).
+ * Se aplica solo a lo que se agrega al DOM (MutationObserver, más abajo),
+ * así que cubre también los formularios que se abren bajo demanda.
+ */
+function associateLabels(root = document) {
+    const labels = [];
+    if (root.matches && root.matches('label:not([for])')) labels.push(root);
+    root.querySelectorAll('label:not([for])').forEach((l) => labels.push(l));
+
+    labels.forEach((label) => {
+        if (label.querySelector('input, select, textarea')) return;
+        for (let sib = label.nextElementSibling; sib; sib = sib.nextElementSibling) {
+            if (sib.tagName === 'LABEL') return;
+            const control = sib.matches('input, select, textarea') ? sib : sib.querySelector('input, select, textarea');
+            if (!control) continue;
+            if (control.type === 'hidden' || (control.type === 'file' && control.classList.contains('hidden'))) return;
+            if (control.hasAttribute('aria-label') || control.hasAttribute('aria-labelledby')) return;
+            if (!control.id) control.id = `auto-field-${++autoFieldIdCounter}`;
+            label.setAttribute('for', control.id);
+            return;
+        }
+    });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    associateLabels(document);
+    new MutationObserver((mutations) => {
+        mutations.forEach((m) => m.addedNodes.forEach((node) => {
+            if (node.nodeType === 1) associateLabels(node);
+        }));
+    }).observe(document.body, { childList: true, subtree: true });
+});
+
+/**
+ * Anuncia "N resultados" a lectores de pantalla después de filtrar una
+ * lista. `total` viene del loader de cada vista; es undefined si la
+ * petición falló o quedó obsoleta (otra búsqueda más nueva la reemplazó),
+ * y en ese caso no se anuncia nada.
+ */
+function announceResultCount(total) {
+    if (typeof total !== 'number') return;
+    announce(tPlural('common.results', total));
+}
+
+const EXPANDABLE_TEXT_CLAMP_CLASSES =['truncate', 'line-clamp-1', 'line-clamp-2', 'line-clamp-3', 'line-clamp-4'];
+// Margen de tolerancia al comparar scrollHeight/clientHeight (o scrollWidth/
+// clientWidth) — con el tamaño de letra aumentado (ver darkmode.js, clases
+// text-boost-N del botón "A+" del navbar) el redondeo de line-height puede
+// dejar 1-3px de diferencia aunque el texto entre completo, mostrando un
+// "Leer más" que no revela nada nuevo al abrirlo. Un desborde real (una
+// línea de más) es mucho mayor que esto, así que no oculta casos genuinos.
+const EXPANDABLE_TEXT_OVERFLOW_TOLERANCE_PX = 4;
+
+/**
+ * Agrega un toggle "Leer más"/"Leer menos" a cada `.expandable-text` que el
+ * navegador esté recortando de verdad (line-clamp-N o `truncate`) — si el
+ * texto entra completo, no agrega nada (evita un link muerto). Se llama una
+ * vez después de pintar cualquier lista de descripciones (ver
+ * views_home.js/views_course_detail.js/views_content_manager.js).
+ *
+ * Un elemento oculto en el momento de llamar (ej. la tarjeta de un curso
+ * dentro de un módulo que todavía no está seleccionado en el dropdown, ver
+ * switchCourseModule) mide scrollHeight/clientHeight en 0 y no se puede
+ * evaluar todavía — se deja SIN marcar como listo para que una llamada
+ * posterior (cuando ya esté visible) lo vuelva a intentar.
+ */
+function setupExpandableText(root = document) {
+    root.querySelectorAll('.expandable-text').forEach((el) => {
+        if (el.dataset.expandableReady) return;
+        if (el.offsetParent === null) return;
+        el.dataset.expandableReady = 'true';
+
+        const clampClass = EXPANDABLE_TEXT_CLAMP_CLASSES.find((c) => el.classList.contains(c));
+        if (!clampClass) return;
+
+        const evaluateOverflow = () => {
+            const isOverflowing = clampClass === 'truncate'
+                ? el.scrollWidth > el.clientWidth + EXPANDABLE_TEXT_OVERFLOW_TOLERANCE_PX
+                : el.scrollHeight > el.clientHeight + EXPANDABLE_TEXT_OVERFLOW_TOLERANCE_PX;
+            if (!isOverflowing) return;
+
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'expandable-text-toggle text-cenat-green text-xs font-medium hover:underline mt-1 block';
+            toggle.textContent = t('common.read_more');
+            toggle.addEventListener('click', (e) => {
+                // El texto suele vivir dentro de una tarjeta clickeable
+                // entera (ver renderCourseCardShell) — sin esto, el click
+                // en el botón también navegaría al curso antes de que se
+                // alcance a ver el texto expandido.
+                e.stopPropagation();
+                const stillClamped = el.classList.toggle(clampClass);
+                toggle.textContent = stillClamped ? t('common.read_more') : t('common.read_less');
+            });
+            el.insertAdjacentElement('afterend', toggle);
+        };
+
+        // Con la pestaña oculta (ej. se abrió en segundo plano) el navegador
+        // no corre requestAnimationFrame — y una medición tomada igual en
+        // ese estado puede dar un ancho/alto transitorio incorrecto. Se
+        // espera a que la pestaña esté visible antes de medir nada.
+        if (document.hidden) {
+            document.addEventListener('visibilitychange', function onVisible() {
+                if (document.hidden) return;
+                document.removeEventListener('visibilitychange', onVisible);
+                requestAnimationFrame(evaluateOverflow);
+            });
+        } else {
+            requestAnimationFrame(evaluateOverflow);
+        }
+    });
+}
+
+function escapeHtml(text) {
+    if (text === null || text === undefined) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// escapeHtml() escapa &, < y > (vía textContent/innerHTML) pero NO comillas —
+// insuficiente cuando el valor va dentro de un atributo `="..."` (href, src,
+// alt, title, value, data-*). Usar esta función en esos casos.
+function escapeAttr(text) {
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// =================================
+// Dropdown Toggle
+// =================================
+
+function toggleDropdown(dropdownId) {
+    const dropdown = document.getElementById(dropdownId);
+    if (dropdown) dropdown.classList.toggle('hidden');
+}
+
+// =================================
+// Contenido bilingüe (título/descripción/pregunta/opción en inglés) —
+// toggle "Agregar en otro idioma" por formulario, siempre opcional (ver
+// four_feature_batch_2026_10_07 item 2). `panelId` debe ser único en la
+// página — en un formulario con varias filas (ej. preguntas de quiz) hay
+// que armarlo con el índice de la fila.
+// =================================
+
+// Elige qué columna mostrar según el idioma activo: en inglés usa el campo
+// `_en` si tiene contenido, si no cae al español (y viceversa en español) —
+// mismo criterio confirmado para el toggle de arriba, nunca rompe contenido
+// que solo tiene español.
+function localizedText(obj, field) {
+    if (!obj) return obj;
+    const primary = obj[field];
+    const en = obj[`${field}_en`];
+    const hasPrimary = primary !== null && primary !== undefined && String(primary).trim() !== '';
+    const hasEn = en !== null && en !== undefined && String(en).trim() !== '';
+    if (typeof getLocale === 'function' && getLocale() === 'en') {
+        return hasEn ? en : primary;
+    }
+    return hasPrimary ? primary : en;
+}
+
+function bilingualToggleHTML(panelId, innerHTML, startOpen = false) {
+    return `
+        <div class="mt-1">
+            <button type="button" onclick="toggleDropdown('${panelId}')" class="text-xs font-medium text-cenat-green hover:underline">
+                + ${t('common.add_other_language')}
+            </button>
+            <div id="${panelId}" class="${startOpen ? '' : 'hidden'} mt-2 pl-3 border-l-2 border-gray-200 dark:border-slate-600 space-y-2">
+                ${innerHTML}
+            </div>
+        </div>`;
+}
+
+// =================================
+// Menús del navbar (menú móvil y menú de usuario)
+// =================================
+
+// Abre/cierra un menú y mantiene aria-expanded del botón que lo controla en
+// sync (sin eso, un lector de pantalla no sabe si el botón "abrió" algo).
+function setNavMenuOpen(menuId, buttonId, open) {
+    const menu = document.getElementById(menuId);
+    const button = document.getElementById(buttonId);
+    if (!menu) return;
+    menu.classList.toggle('hidden', !open);
+    if (button) button.setAttribute('aria-expanded', String(open));
+}
+
+function setMobileMenuOpen(open) { setNavMenuOpen('mobile-menu', 'mobile-menu-btn', open); }
+function setUserDropdownOpen(open) { setNavMenuOpen('user-dropdown', 'user-menu-button', open); }
+function setLanguageDropdownOpen(open) { setNavMenuOpen('language-dropdown', 'language-menu-button', open); }
+function setLanguageDropdownOpenMobile(open) { setNavMenuOpen('language-dropdown-mobile', 'language-menu-button-mobile', open); }
+
+function isNavMenuOpen(menuId) {
+    const menu = document.getElementById(menuId);
+    return !!menu && !menu.classList.contains('hidden');
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    const mobileMenuBtn = document.getElementById('mobile-menu-btn');
+    const mobileMenu = document.getElementById('mobile-menu');
+    const userMenuButton = document.getElementById('user-menu-button');
+    const userDropdown = document.getElementById('user-dropdown');
+    const languageMenus = [
+        { button: document.getElementById('language-menu-button'), dropdown: document.getElementById('language-dropdown'), setOpen: setLanguageDropdownOpen },
+        { button: document.getElementById('language-menu-button-mobile'), dropdown: document.getElementById('language-dropdown-mobile'), setOpen: setLanguageDropdownOpenMobile }
+    ];
+
+    if (mobileMenuBtn && mobileMenu) {
+        mobileMenuBtn.addEventListener('click', function() {
+            setMobileMenuOpen(!isNavMenuOpen('mobile-menu'));
+        });
+        // Antes el menú móvil se quedaba abierto después de tocar un link:
+        // la página nueva cargaba DEBAJO del menú desplegado y había que
+        // volver a tocar la hamburguesa para verla.
+        mobileMenu.addEventListener('click', function(e) {
+            if (e.target.closest('a, button')) setMobileMenuOpen(false);
+        });
+    }
+
+    if (userMenuButton && userDropdown) {
+        userMenuButton.addEventListener('click', function(e) {
+            e.stopPropagation();
+            setUserDropdownOpen(!isNavMenuOpen('user-dropdown'));
+        });
+        // Igual que arriba: ir a "Mi Perfil" o cerrar sesión desde el menú
+        // lo cierra (antes "Mi Perfil" quedaba con el menú abierto encima).
+        userDropdown.addEventListener('click', function(e) {
+            if (e.target.closest('a, button')) setUserDropdownOpen(false);
+        });
+    }
+
+    languageMenus.forEach(function({ button, dropdown, setOpen }) {
+        if (!button || !dropdown) return;
+        button.addEventListener('click', function(e) {
+            e.stopPropagation();
+            setOpen(!isNavMenuOpen(dropdown.id));
+        });
+        dropdown.addEventListener('click', function(e) {
+            const option = e.target.closest('.language-option');
+            if (option) setLocale(option.dataset.locale);
+            setOpen(false);
+        });
+    });
+});
+
+// Clic fuera del navbar: cierra ambos menús. (Se excluye el navbar entero,
+// no solo el menú: cambiar el idioma o el tema desde la barra de arriba con
+// el menú móvil abierto no debería cerrarlo.)
+document.addEventListener('click', function(event) {
+    const navbar = document.getElementById('navbar');
+    const userMenuButton = document.getElementById('user-menu-button');
+    const userDropdown = document.getElementById('user-dropdown');
+    if (userMenuButton && userDropdown && !userMenuButton.contains(event.target) && !userDropdown.contains(event.target)) {
+        setUserDropdownOpen(false);
+    }
+    [
+        { button: document.getElementById('language-menu-button'), dropdown: document.getElementById('language-dropdown'), setOpen: setLanguageDropdownOpen },
+        { button: document.getElementById('language-menu-button-mobile'), dropdown: document.getElementById('language-dropdown-mobile'), setOpen: setLanguageDropdownOpenMobile }
+    ].forEach(function({ button, dropdown, setOpen }) {
+        if (button && dropdown && !button.contains(event.target) && !dropdown.contains(event.target)) {
+            setOpen(false);
+        }
+    });
+    if (navbar && !navbar.contains(event.target)) setMobileMenuOpen(false);
+});
+
+// Navegar (por cualquier vía: link, botón "atrás", teclado) cierra los menús.
+window.addEventListener('hashchange', function() {
+    setMobileMenuOpen(false);
+    setUserDropdownOpen(false);
+    setLanguageDropdownOpen(false);
+    setLanguageDropdownOpenMobile(false);
+});
+
+// Escape cierra el menú abierto y devuelve el foco a su botón (un usuario de
+// teclado no queda "perdido" en un menú que ya no está).
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    if (isNavMenuOpen('user-dropdown')) {
+        setUserDropdownOpen(false);
+        const btn = document.getElementById('user-menu-button');
+        if (btn) btn.focus();
+    }
+    if (isNavMenuOpen('language-dropdown')) {
+        setLanguageDropdownOpen(false);
+        const btn = document.getElementById('language-menu-button');
+        if (btn) btn.focus();
+    }
+    if (isNavMenuOpen('language-dropdown-mobile')) {
+        setLanguageDropdownOpenMobile(false);
+        const btn = document.getElementById('language-menu-button-mobile');
+        if (btn) btn.focus();
+    }
+    if (isNavMenuOpen('mobile-menu')) {
+        setMobileMenuOpen(false);
+        const btn = document.getElementById('mobile-menu-btn');
+        if (btn) btn.focus();
+    }
+});
+
+// =================================
+// Password Visibility Toggle
+// =================================
+
+document.addEventListener('click', function(event) {
+    const btn = event.target.closest('.toggle-password-btn');
+    if (!btn) return;
+
+    const input = document.getElementById(btn.dataset.target);
+    if (!input) return;
+
+    const icon = btn.querySelector('i');
+    const show = input.type === 'password';
+
+    input.type = show ? 'text' : 'password';
+    icon.classList.toggle('fa-eye', !show);
+    icon.classList.toggle('fa-eye-slash', show);
+    btn.setAttribute('aria-label', show ? t('common.hide_password') : t('common.show_password'));
+});
+
+// =================================
+// Progress Bar
+// =================================
+
+function updateProgressBar(elementId, progress) {
+    const progressFill = document.getElementById(elementId);
+    if (progressFill) progressFill.style.width = `${progress}%`;
+}
+
+// =================================
+// Confirmation Dialog
+// =================================
+
+/**
+ * Modal de confirmación propio, en vez del confirm() nativo del navegador
+ * (el feo "localhost:3000 dice..." que no se puede estilizar). Se usa
+ * igual que antes en cada punto donde ya se llamaba — la única diferencia
+ * es que ahora hay que esperarlo: `if (await confirmAction('¿Seguro?'))`.
+ * `danger: false` es para confirmaciones que no son destructivas (hoy
+ * todas las que existen sí lo son, pero queda listo por si hace falta).
+ */
+function confirmAction(message, { confirmLabel = t('common.confirm'), cancelLabel = t('common.cancel'), danger = true } = {}) {
+    return new Promise((resolve) => {
+        const existing = document.getElementById('confirm-modal');
+        if (existing) existing.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'confirm-modal';
+        modal.className = 'fixed inset-0 z-50 flex items-center justify-center px-4';
+        modal.innerHTML = `
+            <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" data-confirm-backdrop></div>
+            <div class="relative bg-white dark:bg-slate-800 rounded-2xl shadow-2xl p-6 max-w-sm w-full fade-in" role="alertdialog" aria-modal="true" aria-labelledby="confirm-modal-message">
+                <div class="flex items-start gap-3">
+                    <div class="w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${danger ? 'bg-red-100 dark:bg-red-900/40 text-red-500' : 'bg-green-100 dark:bg-green-900/40 text-cenat-green'}">
+                        <i class="fas ${danger ? 'fa-exclamation-triangle' : 'fa-question-circle'}"></i>
+                    </div>
+                    <p id="confirm-modal-message" class="text-gray-700 dark:text-slate-200 mt-1.5 leading-snug">${escapeHtml(message)}</p>
+                </div>
+                <div class="flex gap-3 justify-end mt-6">
+                    <button type="button" data-confirm-cancel class="px-4 py-2 rounded-lg text-sm font-semibold text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 transition">${escapeHtml(cancelLabel)}</button>
+                    <button type="button" data-confirm-ok class="px-4 py-2 rounded-lg text-sm font-semibold text-white transition ${danger ? 'bg-red-600 hover:bg-red-700' : 'btn-cenat'}">${escapeHtml(confirmLabel)}</button>
+                </div>
+            </div>
+        `;
+
+        // Único mecanismo de confirmación de acciones destructivas de toda
+        // la app — Escape, foco atrapado en el modal y foco devuelto al botón
+        // que lo abrió los da activateModalA11y (más abajo).
+        let deactivate = () => {};
+        const close = (result) => {
+            deactivate();
+            modal.remove();
+            resolve(result);
+        };
+
+        modal.querySelector('[data-confirm-cancel]').addEventListener('click', () => close(false));
+        modal.querySelector('[data-confirm-ok]').addEventListener('click', () => close(true));
+        modal.querySelector('[data-confirm-backdrop]').addEventListener('click', () => close(false));
+
+        document.body.appendChild(modal);
+        // Foco inicial en "Cancelar" — el default más seguro para una
+        // confirmación (Enter/Space sin querer no dispara la acción).
+        deactivate = activateModalA11y(modal, { onClose: () => close(false), initialFocus: modal.querySelector('[data-confirm-cancel]') });
+    });
+}
+
+// =================================
+// Accesibilidad de modales
+// =================================
+
+// Pila de modales abiertos: con uno encima de otro (p. ej. una confirmación
+// dentro de "Crear usuario"), solo el de más arriba reacciona a Escape/Tab.
+const openModalStack = [];
+
+const MODAL_FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Lo mínimo que un modal necesita para poder usarse sin mouse: al abrirse el
+ * foco entra al modal, Tab/Shift+Tab no se escapan a la página de atrás,
+ * Escape lo cierra (`onClose`), y al cerrarse el foco vuelve a lo que lo
+ * abrió. Devuelve la función que hay que llamar al cerrar (quita el listener
+ * y restaura el foco). Debe llamarse con el modal YA insertado en el DOM.
+ */
+function activateModalA11y(modal, { onClose, initialFocus = null } = {}) {
+    const previouslyFocused = document.activeElement;
+    openModalStack.push(modal);
+
+    const focusables = () => Array.from(modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR)).filter((el) => el.offsetParent !== null);
+
+    const onKeydown = (e) => {
+        if (openModalStack[openModalStack.length - 1] !== modal) return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            if (onClose) onClose();
+            return;
+        }
+        if (e.key !== 'Tab') return;
+        const items = focusables();
+        if (items.length === 0) { e.preventDefault(); return; }
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (!modal.contains(document.activeElement)) {
+            e.preventDefault();
+            first.focus();
+        } else if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+        }
+    };
+    document.addEventListener('keydown', onKeydown, true);
+
+    const target = initialFocus || focusables()[0];
+    if (target) target.focus();
+
+    return function deactivate() {
+        document.removeEventListener('keydown', onKeydown, true);
+        const i = openModalStack.indexOf(modal);
+        if (i >= 0) openModalStack.splice(i, 1);
+        if (previouslyFocused && document.contains(previouslyFocused) && typeof previouslyFocused.focus === 'function') {
+            previouslyFocused.focus();
+        }
+    };
+}
+
+// =================================
+// Diálogo de texto (reemplazo de prompt())
+// =================================
+
+/**
+ * Pide un texto en un modal propio, igual de estilizado y accesible que
+ * confirmAction, en vez del prompt() nativo del navegador ("localhost:3000
+ * dice...", sin estilo, sin modo oscuro, sin poder limitar el largo).
+ * Devuelve el texto (sin recortar) o `null` si se cancela — misma
+ * convención que prompt(), así el llamador casi no cambia.
+ * Enter en el campo confirma; Escape y clic fuera cancelan.
+ */
+function promptText(message, defaultValue = '', { maxLength = 150, confirmLabel = t('common.confirm'), cancelLabel = t('common.cancel') } = {}) {
+    return new Promise((resolve) => {
+        const existing = document.getElementById('prompt-modal');
+        if (existing) existing.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'prompt-modal';
+        modal.className = 'fixed inset-0 z-50 flex items-center justify-center px-4';
+        modal.innerHTML = `
+            <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" data-prompt-backdrop></div>
+            <form class="relative bg-white dark:bg-slate-800 rounded-2xl shadow-2xl p-6 max-w-sm w-full fade-in" role="dialog" aria-modal="true" aria-labelledby="prompt-modal-message">
+                <label id="prompt-modal-message" for="prompt-modal-input" class="block text-gray-700 dark:text-slate-200 font-medium mb-3">${escapeHtml(message)}</label>
+                <input id="prompt-modal-input" type="text" maxlength="${Number(maxLength)}" value="${escapeAttr(defaultValue)}" autocomplete="off"
+                    class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                <div class="flex gap-3 justify-end mt-6">
+                    <button type="button" data-prompt-cancel class="px-4 py-2 rounded-lg text-sm font-semibold text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 transition">${escapeHtml(cancelLabel)}</button>
+                    <button type="submit" class="btn-cenat px-4 py-2 text-sm">${escapeHtml(confirmLabel)}</button>
+                </div>
+            </form>
+        `;
+
+        let deactivate = () => {};
+        const close = (result) => {
+            deactivate();
+            modal.remove();
+            resolve(result);
+        };
+
+        const input = modal.querySelector('#prompt-modal-input');
+        modal.querySelector('form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            close(input.value);
+        });
+        modal.querySelector('[data-prompt-cancel]').addEventListener('click', () => close(null));
+        modal.querySelector('[data-prompt-backdrop]').addEventListener('click', () => close(null));
+
+        document.body.appendChild(modal);
+        deactivate = activateModalA11y(modal, { onClose: () => close(null), initialFocus: input });
+        input.select();
+    });
+}
+
+// =================================
+// Debounce
+// =================================
+
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+// =================================
+// Guardián de respuestas obsoletas
+// =================================
+
+/**
+ * Si el usuario dispara varias peticiones seguidas (tipeando rápido en un
+ * buscador, cambiando de página rápido), una respuesta que llega tarde no
+ * debe pisar el resultado de una petición más nueva. Este mismo patrón de
+ * "requestToken" manual se repetía copiado en varias vistas con listas
+ * paginadas/buscables (home, mis cursos, admin de cursos, admin de
+ * usuarios) — queda acá en un solo lugar.
+ *
+ * Uso:
+ *   const guard = createStaleResponseGuard();
+ *   async function loadX(page) {
+ *       const isStale = guard.start();
+ *       try {
+ *           const response = await api.getAll(...);
+ *           if (isStale()) return;
+ *           ...
+ *       } catch (error) {
+ *           if (isStale()) return;
+ *           ...
+ *       }
+ *   }
+ */
+function createStaleResponseGuard() {
+    let currentToken = 0;
+    return {
+        start() {
+            const token = ++currentToken;
+            return () => token !== currentToken;
+        }
+    };
+}
+
+// =================================
+// Local Storage Helpers
+// =================================
+
+function saveToLocalStorage(key, value) {
+    try {
+        localStorage.setItem(key, JSON.stringify(value));
+        return true;
+    } catch (error) {
+        console.error('Error saving to localStorage:', error);
+        return false;
+    }
+}
+
+function getFromLocalStorage(key) {
+    try {
+        const item = localStorage.getItem(key);
+        return item ? JSON.parse(item) : null;
+    } catch (error) {
+        return null;
+    }
+}
+
+function removeFromLocalStorage(key) {
+    try {
+        localStorage.removeItem(key);
+        return true;
+    } catch (error) {
+        return false;
+    }
+}
+
+// =================================
+// Copy to Clipboard
+// =================================
+
+async function copyToClipboard(text) {
+    try {
+        await navigator.clipboard.writeText(text);
+        showToast(t('common.copied'), 'success');
+        return true;
+    } catch (error) {
+        showToast(t('errors.copy_failed'), 'error');
+        return false;
+    }
+}
+
+// =================================
+// Paginación reutilizable
+// =================================
+
+function renderPagination(currentPage, totalPages, totalItems, perPage, callbackFn) {
+    if (totalPages <= 1) return '';
+
+    const start = (currentPage - 1) * perPage + 1;
+    const end = Math.min(currentPage * perPage, totalItems);
+
+    let pages = [];
+    if (totalPages <= 5) {
+        pages = Array.from({ length: totalPages }, (_, i) => i + 1);
+    } else if (currentPage <= 3) {
+        pages = [1, 2, 3, 4, 5];
+    } else if (currentPage >= totalPages - 2) {
+        pages = [totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1, totalPages];
+    } else {
+        pages = [currentPage - 2, currentPage - 1, currentPage, currentPage + 1, currentPage + 2];
+    }
+
+    // <nav> con nombre + aria-current en la página actual + nombres en los
+    // botones de solo ícono (antes un lector de pantalla leía "botón, botón,
+    // 1, 2, 3, botón" sin decir cuál era la página actual ni qué hacían las
+    // flechas).
+    return `
+        <nav aria-label="${escapeAttr(t('common.pagination_nav'))}" class="flex items-center justify-between text-sm text-gray-600 dark:text-slate-400">
+            <span>${t('common.showing_range', { start, end, total: totalItems })}</span>
+            <div class="flex items-center gap-1">
+                <button type="button" onclick="${callbackFn}(${currentPage - 1})"
+                    class="pagination-btn px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed"
+                    aria-label="${escapeAttr(t('common.previous_page'))}"
+                    ${currentPage === 1 ? 'disabled' : ''}>
+                    <i class="fas fa-chevron-left" aria-hidden="true"></i>
+                </button>
+                ${pages.map(p => `
+                    <button type="button" onclick="${callbackFn}(${p})"
+                        class="pagination-btn px-3 py-1 rounded font-medium transition ${p === currentPage
+                            ? 'bg-cenat-green text-white'
+                            : 'hover:bg-gray-100 dark:hover:bg-slate-700 text-gray-700 dark:text-slate-300'}"
+                        aria-label="${escapeAttr(t('common.go_to_page', { page: p }))}"
+                        ${p === currentPage ? 'aria-current="page"' : ''}>
+                        ${p}
+                    </button>
+                `).join('')}
+                <button type="button" onclick="${callbackFn}(${currentPage + 1})"
+                    class="pagination-btn px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed"
+                    aria-label="${escapeAttr(t('common.next_page'))}"
+                    ${currentPage === totalPages ? 'disabled' : ''}>
+                    <i class="fas fa-chevron-right" aria-hidden="true"></i>
+                </button>
+            </div>
+        </nav>
+    `;
+}
+
+// =================================
+// Bloque de "no hay nada que mostrar"
+// =================================
+
+/**
+ * Icono + título + subtítulo/CTA opcionales — el mismo bloque se repetía a
+ * mano en ~12 vistas con pequeñas variaciones de clases (fondo blanco
+ * cuando va sobre una foto de fondo, variantes de modo oscuro en los
+ * paneles admin, tamaño del título). Cada caller sigue pasando sus clases
+ * exactas: esto solo evita repetir la estructura del bloque en sí.
+ */
+function renderEmptyStateHTML({ wrapperClass, icon, titleClass, title, subtitleHtml = '', ctaHtml = '' }) {
+    return `
+        <div class="${wrapperClass}">
+            <i class="fas ${icon}"></i>
+            <p class="${titleClass}">${title}</p>
+            ${subtitleHtml}
+            ${ctaHtml}
+        </div>
+    `;
+}
+
+// =================================
+// Tarjeta de curso (home, mis-cursos, cursos del profesor)
+// =================================
+
+/**
+ * Cascarón compartido por las 3 tarjetas de curso de la app (catálogo,
+ * "mis cursos" del estudiante, "mis cursos" del profesor) — miniatura o
+ * ícono de respaldo, badge de inactivo opcional, y el cuerpo (título +
+ * lo que sea específico de cada vista: progreso, conteos, profesor...)
+ * que arma cada caller y pasa ya renderizado en `bodyHtml`.
+ */
+function renderCourseCardShell({ course, navigateToPath, heightClass = 'h-40', showInactiveBadge = false, bodyHtml }) {
+    const thumbnailUrl = course.thumbnail || null;
+    // La tarjeta entera es clickeable, pero antes era un <div onclick>: un
+    // usuario de teclado nunca la alcanzaba con Tab (el foco saltaba de una
+    // tarjeta a su "Leer más" y a la siguiente) y un lector de pantalla no la
+    // anunciaba como enlace. Ahora es un enlace REAL superpuesto a toda la
+    // tarjeta (.course-card-link, ver styles.css): Tab lo enfoca, Enter lo
+    // abre, "abrir en pestaña nueva" funciona, y su nombre es el título del
+    // curso. Lo interactivo que vive dentro de la tarjeta ("Leer más") queda
+    // por encima del enlace (z-index) para seguir siendo clickeable.
+    // La miniatura pasa a alt="": el enlace y el título ya nombran el curso,
+    // y repetirlo en la imagen hacía que se leyera dos veces.
+    return `
+        <div class="course-card relative bg-white rounded-xl shadow-md overflow-hidden border border-gray-100">
+            <a href="#${escapeAttr(navigateToPath)}" class="course-card-link" aria-label="${escapeAttr(course.title)}"></a>
+            <div class="${heightClass} bg-gradient-to-br from-cenat-green to-cenat-green-light flex items-center justify-center relative overflow-hidden">
+                ${thumbnailUrl
+                    ? `<img src="${escapeAttr(thumbnailUrl)}" alt="" class="w-full h-full object-cover" loading="lazy" decoding="async">`
+                    : `<i class="fas fa-flask text-5xl text-white opacity-80"></i>`
+                }
+                ${showInactiveBadge && !course.is_active ? `<span class="badge badge-inactive absolute top-3 right-3">${t('admin.status_inactive')}</span>` : ''}
+            </div>
+            <div class="p-5">
+                ${bodyHtml}
+            </div>
+        </div>
+    `;
+}
+
+// =================================
+// Selector de profesores (crear/editar curso)
+// =================================
+
+/**
+ * El checkbox marcado asigna a ese profesor como profesor principal (de
+ * todo el curso) — el escopeo por carpeta (course_teachers.module_id)
+ * existió acá antes, pero se sacó de esta lista a pedido de Mauricio: en
+ * la práctica nadie lo usaba (confirmado: 0 filas con module_id no-nulo en
+ * la base real), y con el editor rápido de profesores por curso hijo de
+ * módulo (ver views_content_manager.js) ya no hacía falta. El mecanismo de
+ * permisos por carpeta (Course.canManageContent, requireCourseManager) se
+ * deja intacto en el backend por si se necesita reactivar más adelante —
+ * simplemente ya no hay forma de asignarlo desde acá.
+ */
+function renderTeacherCheckboxesHTML(teachers, selectedIds = []) {
+    if (teachers.length === 0) {
+        return `<p class="text-sm text-gray-400 dark:text-slate-500">${t('courseForm.no_teachers_yet')}</p>`;
+    }
+    const rowsHTML = teachers.map(teacher => {
+        const checked = selectedIds.includes(teacher.id);
+        return `
+        <div class="teacher-row flex items-center gap-3 py-2 flex-wrap" data-search="${escapeAttr(normalizeSearchText(`${teacher.name} ${teacher.email}`))}">
+            <label class="flex items-start gap-3 min-w-0 max-w-full text-base text-gray-700 dark:text-slate-300">
+                <input type="checkbox" name="teacher_ids" value="${teacher.id}" data-teacher-id="${teacher.id}"
+                    class="teacher-checkbox mt-1 w-4 h-4 shrink-0 rounded border-gray-300 text-cenat-green focus:ring-cenat-green" ${checked ? 'checked' : ''}>
+                <span class="min-w-0 break-words">${escapeHtml(teacher.name)} <span class="text-sm text-gray-400 dark:text-slate-500">(${escapeHtml(teacher.email)})</span></span>
+            </label>
+        </div>
+        `;
+    }).join('');
+
+    // El buscador va "sticky" arriba: el recuadro que contiene esta lista
+    // (en todos los formularios que la usan) es el que tiene el scroll, y
+    // sin esto la barra se iría de vista al bajar por la lista.
+    // `-top-4 -mt-4 pt-4`: sticky se ancla al borde del CONTENIDO del
+    // recuadro, no al de su padding (p-4 en la mayoría de los formularios),
+    // así que con `top-0` las filas se asomaban por la franja de padding
+    // sobre la barra. Así el bloque se extiende hacia arriba hasta cubrirla;
+    // en un recuadro con menos padding (p-3, o ninguno) ese exceso queda
+    // recortado fuera del scroll sin que se note.
+    // El <input> no lleva `name` a propósito: no debe colarse en ningún
+    // FormData/serialización de los formularios que envuelven esta lista.
+    return `
+        <div class="sticky -top-4 z-10 -mt-4 bg-white pb-2 pt-4">
+            <div class="relative">
+                <input type="search" class="teacher-search-input w-full pl-9 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-cenat-green"
+                    placeholder="${escapeAttr(t('courseForm.teacher_search_placeholder'))}"
+                    aria-label="${escapeAttr(t('courseForm.teacher_search_aria_label'))}" autocomplete="off">
+                <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none"></i>
+            </div>
+            <p class="teacher-selected-count text-xs text-gray-500 mt-1"></p>
+        </div>
+        <div class="teacher-list">${rowsHTML}</div>
+        <p class="teacher-no-results hidden text-sm text-gray-400 dark:text-slate-500 py-2" role="status">${t('courseForm.teacher_search_no_results')}</p>
+    `;
+}
+
+/**
+ * Minúsculas y sin tildes/diacríticos ("Sofía" → "sofia", "Núñez" → "nunez"),
+ * para que buscar sin acentos encuentre igual a quien sí los lleva.
+ */
+function normalizeSearchText(text) {
+    return String(text || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+/**
+ * Conecta el buscador de la lista de profesores. El filtro solo OCULTA filas
+ * (style.display) — nunca las saca del DOM: un profesor ya marcado que no
+ * coincide con la búsqueda sigue marcado, y getSelectedTeacherIds lo sigue
+ * leyendo al guardar. Por eso el contador "N seleccionados": al filtrar, los
+ * marcados que quedan fuera de la búsqueda dejan de verse, y el contador es
+ * la forma de saber cuántos hay asignados igual.
+ * Se busca por nombre y correo; varias palabras se combinan con AND en
+ * cualquier orden ("rojas ana" encuentra a "Ana Rojas").
+ */
+function setupTeacherCheckboxFilter(container) {
+    // El <label> "Profesores asignados" que precede al recuadro no puede
+    // apuntar a un único control (son N checkboxes + el buscador): se lo
+    // toma como nombre del GRUPO, así un lector de pantalla anuncia "grupo
+    // Profesores asignados" al entrar a la lista.
+    const groupLabel = container.previousElementSibling;
+    if (groupLabel && groupLabel.tagName === 'LABEL') {
+        if (!groupLabel.id) groupLabel.id = `${container.id || 'teacher-list'}-label`;
+        container.setAttribute('role', 'group');
+        container.setAttribute('aria-labelledby', groupLabel.id);
+    }
+
+    const searchInput = container.querySelector('.teacher-search-input');
+    if (!searchInput) return; // lista vacía: no se pintó el buscador
+    const rows = Array.from(container.querySelectorAll('.teacher-row'));
+    const counter = container.querySelector('.teacher-selected-count');
+    const noResults = container.querySelector('.teacher-no-results');
+
+    const updateSelectedCount = () => {
+        const selected = container.querySelectorAll('input[name="teacher_ids"]:checked').length;
+        counter.textContent = tPlural('courseForm.teachers_selected', selected);
+    };
+
+    const applyFilter = () => {
+        const terms = normalizeSearchText(searchInput.value).split(/\s+/).filter(Boolean);
+        let visibleCount = 0;
+        rows.forEach(row => {
+            const matches = terms.every(term => row.dataset.search.includes(term));
+            // style.display y no la clase `hidden`: `flex` (de la fila) y
+            // `hidden` son ambas utilidades de display y la que gana depende
+            // del orden en el CSS compilado.
+            row.style.display = matches ? '' : 'none';
+            if (matches) visibleCount++;
+        });
+        noResults.classList.toggle('hidden', visibleCount > 0);
+    };
+
+    searchInput.addEventListener('input', applyFilter);
+    // Enter en un <input> dentro de un <form> lo envía: acá guardaría el
+    // curso entero a medio buscar un profesor.
+    searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') e.preventDefault();
+    });
+    // Delegado en la lista (un elemento nuevo en cada carga): el contenedor
+    // persiste entre llamadas a loadTeacherCheckboxes, así que un listener
+    // puesto en él se acumularía.
+    container.querySelector('.teacher-list').addEventListener('change', updateSelectedCount);
+    updateSelectedCount();
+}
+
+async function loadTeacherCheckboxes(containerId, selectedIds = []) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    try {
+        const response = await usersAPI.getByRole('teacher');
+        container.innerHTML = renderTeacherCheckboxesHTML(response.data || [], selectedIds);
+        setupTeacherCheckboxFilter(container);
+    } catch (error) {
+        container.innerHTML = `<p class="text-sm text-red-500">${t('courseForm.load_teachers_failed')}</p>`;
+    }
+}
+
+function getSelectedTeacherIds(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return [];
+    return Array.from(container.querySelectorAll('input[name="teacher_ids"]:checked')).map(el => parseInt(el.value, 10));
+}
+
+// Mismos ids/orden que CERTIFICATE_STYLES en src/utils/certificate.js — se
+// mantiene esta copia acá en vez de pedirlos al backend porque son estilos
+// fijos del código (no algo que el admin pueda crear/editar), igual que
+// "Tipo de pregunta" en el editor de cuestionarios.
+function getCertificateStyles() {
+    return [
+        { id: 'classic', label: t('courseForm.certificate_classic') },
+        { id: 'modern', label: t('courseForm.certificate_modern') },
+        { id: 'minimal', label: t('courseForm.certificate_minimal') }
+    ];
+}
+
+function renderCertificateStyleOptions(selectedId) {
+    return getCertificateStyles().map(s => `
+        <option value="${s.id}" ${s.id === selectedId ? 'selected' : ''}>${escapeHtml(s.label)}</option>
+    `).join('');
+}
+
+// =================================
+// Embed de video externo (YouTube/Vimeo)
+// =================================
+
+/**
+ * Extrae el ID de un video de YouTube de cualquier formato de link común
+ * (watch?v=, youtu.be/, /shorts/, /embed/). `null` si la URL no es de
+ * YouTube o no se pudo extraer el ID.
+ */
+function getYoutubeVideoId(url) {
+    const match = String(url || '').match(
+        /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/
+    );
+    return match ? match[1] : null;
+}
+
+/**
+ * URL de embed simple (iframe plano, sin la API de YouTube) — se usa
+ * únicamente en el preview del formulario del profesor: ahí SÍ conviene
+ * que se vea el error de YouTube tal cual si el video no se puede
+ * embeber, como pista de que probó una URL que no va a funcionar para
+ * los estudiantes.
+ */
+function getYoutubeEmbedUrl(url) {
+    const id = getYoutubeVideoId(url);
+    if (!id) return null;
+    // El parámetro "origin" es lo que recomienda YouTube para que el
+    // reproductor valide desde dónde se está embebiendo.
+    const origin = encodeURIComponent(window.location.origin);
+    return `https://www.youtube.com/embed/${id}?origin=${origin}`;
+}
+
+/**
+ * Igual que getYoutubeEmbedUrl pero para Vimeo (vimeo.com/{id}).
+ */
+function getVimeoEmbedUrl(url) {
+    const match = String(url || '').match(/vimeo\.com\/(\d+)/);
+    return match ? `https://player.vimeo.com/video/${match[1]}` : null;
+}
+
+/**
+ * Intenta YouTube primero, luego Vimeo. `null` si el proveedor no se
+ * reconoce — en ese caso el contenido de tipo 'url' se queda con el
+ * comportamiento de antes (solo un link para abrir en pestaña nueva).
+ */
+function getVideoEmbedUrl(url) {
+    return getYoutubeEmbedUrl(url) || getVimeoEmbedUrl(url) || null;
+}
+
+// =================================
+// Reproductor de YouTube con detección de error
+// =================================
+// Un <iframe src="youtube.com/embed/ID"> plano no avisa cuando el video
+// no se puede reproducir ahí (el dueño lo restringió, fue borrado, etc.)
+// — YouTube simplemente dibuja SU propio cartel de error DENTRO del
+// iframe, y no hay forma de detectarlo desde afuera. La única manera de
+// enterarse es con la API oficial de YouTube (que sí avisa por
+// postMessage), para poder ocultar el reproductor roto y mostrar en su
+// lugar el link de "ver en YouTube" que ya está arriba de la tarjeta.
+
+let ytApiReady = false;
+let ytApiLoading = false;
+const ytPendingEmbeds = [];
+
+function loadYoutubeApi() {
+    if (ytApiReady || ytApiLoading) return;
+    ytApiLoading = true;
+    window.onYouTubeIframeAPIReady = function () {
+        ytApiReady = true;
+        ytPendingEmbeds.forEach((fn) => fn());
+        ytPendingEmbeds.length = 0;
+    };
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+}
+
+/**
+ * Reemplaza el div `containerId` (vacío) por el reproductor real de
+ * YouTube. Si el video no se puede reproducir ahí (códigos 101/150: el
+ * dueño no permite incrustarlo en otros sitios; 100: no existe o es
+ * privado), oculta el reproductor y muestra el mensaje de
+ * `data-embed-fallback` que esté al lado, en vez de dejar ver el cartel
+ * de error de YouTube.
+ */
+function createYoutubeEmbed(containerId, videoId) {
+    const create = () => {
+        const el = document.getElementById(containerId);
+        // El elemento puede ya no existir si el usuario navegó a otra
+        // vista mientras se cargaba la API (es asíncrona).
+        if (!el || typeof YT === 'undefined') return;
+
+        // Hay que guardar esta referencia ANTES de crear el YT.Player:
+        // el constructor reemplaza `el` por el iframe real de YouTube de
+        // forma síncrona, así que buscar por containerId de nuevo DENTRO
+        // de onError (que se dispara después, de forma asíncrona) ya no
+        // encontraría nada.
+        const wrapper = el.closest('[data-embed-wrapper]');
+
+        new YT.Player(containerId, {
+            videoId,
+            playerVars: { origin: window.location.origin },
+            events: {
+                onError: () => {
+                    if (!wrapper) return;
+                    wrapper.querySelector('.video-player-container')?.remove();
+                    wrapper.querySelector('[data-embed-fallback]')?.classList.remove('hidden');
+                }
+            }
+        });
+    };
+
+    if (ytApiReady) {
+        create();
+    } else {
+        ytPendingEmbeds.push(create);
+        loadYoutubeApi();
+    }
+}
+
+/**
+ * Busca todos los `[data-yt-embed]` ya insertados en el DOM (ver
+ * renderUrlContentRow en views_course_detail.js) y crea su reproductor.
+ * Se llama una sola vez después de pintar la página — el checkbox de
+ * progreso y el reordenamiento no vuelven a tocar estos nodos, así que no
+ * hace falta re-inicializar en cada interacción.
+ */
+function initYoutubeEmbeds() {
+    document.querySelectorAll('[data-yt-embed]').forEach((el) => {
+        createYoutubeEmbed(el.id, el.dataset.ytEmbed);
+    });
+}
+
+// =================================
+// Export al objeto window
+// =================================
+
+window.showToast = showToast;
+window.hideToast = hideToast;
+window.showLoading = showLoading;
+window.formatDate = formatDate;
+window.formatDateTime = formatDateTime;
+window.formatFileSize = formatFileSize;
+window.checkFileSize = checkFileSize;
+window.formatDuration = formatDuration;
+window.isValidEmail = isValidEmail;
+window.validateForm = validateForm;
+window.createElementFromHTML = createElementFromHTML;
+window.scrollToElement = scrollToElement;
+window.setupExpandableText = setupExpandableText;
+window.escapeHtml = escapeHtml;
+window.toggleDropdown = toggleDropdown;
+window.updateProgressBar = updateProgressBar;
+window.confirmAction = confirmAction;
+window.debounce = debounce;
+window.createStaleResponseGuard = createStaleResponseGuard;
+window.saveToLocalStorage = saveToLocalStorage;
+window.getFromLocalStorage = getFromLocalStorage;
+window.removeFromLocalStorage = removeFromLocalStorage;
+window.copyToClipboard = copyToClipboard;
+window.renderPagination = renderPagination;
+window.renderTeacherCheckboxesHTML = renderTeacherCheckboxesHTML;
+window.loadTeacherCheckboxes = loadTeacherCheckboxes;
+window.getSelectedTeacherIds = getSelectedTeacherIds;
+window.getYoutubeVideoId = getYoutubeVideoId;
+window.getYoutubeEmbedUrl = getYoutubeEmbedUrl;
+window.getVimeoEmbedUrl = getVimeoEmbedUrl;
+window.getVideoEmbedUrl = getVideoEmbedUrl;
+window.initYoutubeEmbeds = initYoutubeEmbeds;

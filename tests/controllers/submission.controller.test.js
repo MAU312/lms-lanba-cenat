@@ -1,0 +1,267 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'fs';
+import * as submissionController from '../../src/controllers/submission.controller.js';
+import Content from '../../src/models/Content.js';
+import Course from '../../src/models/Course.js';
+import TaskSubmission from '../../src/models/TaskSubmission.js';
+import { mockReq, mockRes } from '../helpers/http.js';
+
+test('submitTask: 400 si no viene archivo', async () => {
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 2, role: 'student' } } });
+  req.taskContent = { id: 1, course_id: 5 };
+  const res = mockRes();
+  await submissionController.submitTask(req, res);
+  assert.equal(res.statusCode, 400);
+});
+
+test('submitTask: 400 y borra el archivo si ya había entregado (TaskSubmission.create devuelve null)', async (t) => {
+  t.mock.method(TaskSubmission, 'create', async () => null);
+  const deleteFileCall = t.mock.method(fs.promises, 'unlink', async () => {});
+
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 2, role: 'student' } }, file: { filename: 'x.pdf' } });
+  req.taskContent = { id: 1, course_id: 5 };
+  const res = mockRes();
+
+  await submissionController.submitTask(req, res);
+
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body.message, /Solo se permite una entrega/);
+  assert.equal(deleteFileCall.mock.calls.length, 1, 'debe borrar el archivo recién subido, no dejarlo huérfano');
+});
+
+test('submitTask: éxito marca la tarea como completada y recalcula el progreso', async (t) => {
+  t.mock.method(TaskSubmission, 'create', async () => 77);
+  const markCompletedCall = t.mock.method(Content, 'markCompleted', async () => true);
+  const recalcCall = t.mock.method(Content, 'recalculateCourseProgress', async () => ({ progress: 100, total: 3, completed: 3 }));
+
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 2, role: 'student' } }, file: { filename: 'x.pdf' } });
+  req.taskContent = { id: 1, course_id: 5 };
+  const res = mockRes();
+
+  await submissionController.submitTask(req, res);
+
+  assert.equal(res.statusCode, 201);
+  assert.equal(markCompletedCall.mock.calls[0].arguments[0], 1);
+  assert.equal(markCompletedCall.mock.calls[0].arguments[1], 2);
+  assert.equal(recalcCall.mock.calls[0].arguments[0], 5);
+  assert.equal(res.body.data.progress, 100);
+});
+
+test('getMySubmission: devuelve null si el usuario no ha entregado (no un error)', async (t) => {
+  t.mock.method(TaskSubmission, 'findByContentAndUser', async () => undefined);
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 2 } } });
+  const res = mockRes();
+  await submissionController.getMySubmission(req, res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.data, null);
+});
+
+test('downloadSubmission: 404 si la entrega no existe', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => undefined);
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 2, role: 'student' } } });
+  const res = mockRes();
+  await submissionController.downloadSubmission(req, res);
+  assert.equal(res.statusCode, 404);
+});
+
+test('downloadSubmission: 403 si no es el dueño, ni admin, ni profesor del curso', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 99, file_url: '/uploads/submissions/x.pdf' }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, course_id: 5, folder_id: null }));
+  t.mock.method(Course, 'canManageContent', async () => false);
+
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 2, role: 'student' } } });
+  const res = mockRes();
+  await submissionController.downloadSubmission(req, res);
+  assert.equal(res.statusCode, 403);
+});
+
+test('downloadSubmission: el propio estudiante dueño puede descargar sin ser admin/profesor', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2, file_url: '/uploads/submissions/x.pdf' }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, course_id: 5 }));
+  t.mock.method(fs, 'existsSync', () => true);
+
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 2, role: 'student' } } });
+  const res = mockRes();
+  await submissionController.downloadSubmission(req, res);
+  assert.equal(res.downloadCall.fileName, 'x.pdf');
+});
+
+test('downloadSubmission: el profesor del curso puede descargar sin ser el dueño', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 99, file_url: '/uploads/submissions/x.pdf' }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, course_id: 5, folder_id: null }));
+  t.mock.method(Course, 'canManageContent', async () => true);
+  t.mock.method(fs, 'existsSync', () => true);
+
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 3, role: 'teacher' } } });
+  const res = mockRes();
+  await submissionController.downloadSubmission(req, res);
+  assert.equal(res.downloadCall.fileName, 'x.pdf');
+});
+
+test('downloadSubmission: el profesor escopeado a OTRO módulo no puede descargar (canManageContent en false)', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 99, file_url: '/uploads/submissions/x.pdf' }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, course_id: 5, folder_id: 7 }));
+  const canManageCall = t.mock.method(Course, 'canManageContent', async () => false);
+
+  const req = mockReq({ params: { id: 1 }, session: { user: { id: 3, role: 'teacher' } } });
+  const res = mockRes();
+  await submissionController.downloadSubmission(req, res);
+
+  assert.equal(res.statusCode, 403);
+  assert.deepEqual(canManageCall.mock.calls[0].arguments, [5, 3, 7]);
+});
+
+test('reviewSubmission: 404 si la entrega no existe', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => undefined);
+  const req = mockReq({ params: { id: 1 }, body: { feedback: 'ok' } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+  assert.equal(res.statusCode, 404);
+});
+
+test('reviewSubmission: éxito marca revisada con el feedback dado (sin calificación)', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2 }));
+  const markCall = t.mock.method(TaskSubmission, 'markReviewed', async () => true);
+
+  const req = mockReq({ params: { id: 1 }, body: { feedback: 'Buen trabajo' } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(markCall.mock.calls[0].arguments, [1, 'Buen trabajo', null]);
+});
+
+test('reviewSubmission: guarda la calificación cuando la tarea tiene weight_percent y el valor está en rango', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2 }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, type: 'task', weight_percent: 10 }));
+  const markCall = t.mock.method(TaskSubmission, 'markReviewed', async () => true);
+
+  const req = mockReq({ params: { id: 1 }, body: { feedback: 'Buen trabajo', score_earned: 7 } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(markCall.mock.calls[0].arguments, [1, 'Buen trabajo', 7]);
+});
+
+test('reviewSubmission: 400 si la tarea no tiene weight_percent asignado y se intenta calificar', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2 }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, type: 'task', weight_percent: null }));
+  const markCall = t.mock.method(TaskSubmission, 'markReviewed', async () => true);
+
+  const req = mockReq({ params: { id: 1 }, body: { score_earned: 7 } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(markCall.mock.calls.length, 0);
+});
+
+test('reviewSubmission: 400 si la calificación es mayor al weight_percent de la tarea', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2 }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, type: 'task', weight_percent: 10 }));
+
+  const req = mockReq({ params: { id: 1 }, body: { score_earned: 15 } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 400);
+});
+
+test('reviewSubmission: 400 si la calificación es negativa', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2 }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, type: 'task', weight_percent: 10 }));
+
+  const req = mockReq({ params: { id: 1 }, body: { score_earned: -1 } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 400);
+});
+
+test('reviewSubmission: si solo se manda score_earned, conserva el feedback ya guardado (no lo pisa con null)', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2, feedback: 'Comentario previo', score_earned: null }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, type: 'task', weight_percent: 10 }));
+  const markCall = t.mock.method(TaskSubmission, 'markReviewed', async () => true);
+
+  const req = mockReq({ params: { id: 1 }, body: { score_earned: 8 } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(markCall.mock.calls[0].arguments, [1, 'Comentario previo', 8]);
+});
+
+test('reviewSubmission: si solo se manda feedback, conserva la nota ya guardada (no la pisa con null)', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2, feedback: null, score_earned: 9 }));
+  const markCall = t.mock.method(TaskSubmission, 'markReviewed', async () => true);
+
+  const req = mockReq({ params: { id: 1 }, body: { feedback: 'Corregido el comentario' } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(markCall.mock.calls[0].arguments, [1, 'Corregido el comentario', 9]);
+});
+
+test('reviewSubmission: score_earned="" borra explícitamente una nota ya puesta', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2, feedback: 'ok', score_earned: 9 }));
+  const markCall = t.mock.method(TaskSubmission, 'markReviewed', async () => true);
+
+  const req = mockReq({ params: { id: 1 }, body: { feedback: 'ok', score_earned: '' } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(markCall.mock.calls[0].arguments, [1, 'ok', null]);
+});
+
+test('reviewSubmission: permite calificar con 0 cuando la tarea vale 0% (0 no es "sin weight_percent")', async (t) => {
+  t.mock.method(TaskSubmission, 'findById', async () => ({ id: 1, content_id: 10, user_id: 2 }));
+  t.mock.method(Content, 'findById', async () => ({ id: 10, type: 'task', weight_percent: 0 }));
+  const markCall = t.mock.method(TaskSubmission, 'markReviewed', async () => true);
+
+  const req = mockReq({ params: { id: 1 }, body: { score_earned: 0 } });
+  const res = mockRes();
+  await submissionController.reviewSubmission(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(markCall.mock.calls[0].arguments, [1, null, 0]);
+});
+
+test('listSubmissions: 404 si la tarea no existe', async (t) => {
+  t.mock.method(Content, 'findById', async () => undefined);
+  const req = mockReq({ params: { id: 1 }, query: {} });
+  const res = mockRes();
+  await submissionController.listSubmissions(req, res);
+  assert.equal(res.statusCode, 404);
+});
+
+test('listSubmissions: devuelve las entregas paginadas', async (t) => {
+  t.mock.method(Content, 'findById', async () => ({ id: 1, title: 'Tarea' }));
+  const findCall = t.mock.method(TaskSubmission, 'findPaginatedByContent', async () => ({
+    rows: [{ id: 1, student_name: 'Ana' }],
+    total: 1
+  }));
+
+  const req = mockReq({ params: { id: 1 }, query: {} });
+  const res = mockRes();
+  await submissionController.listSubmissions(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.data.submissions.length, 1);
+  assert.deepEqual(res.body.pagination, { page: 1, limit: 20, total: 1, totalPages: 1 });
+  assert.deepEqual(findCall.mock.calls[0].arguments, [1, { page: 1, limit: 20 }]);
+});
+
+test('listSubmissions: limita el "limit" recibido por query string a un máximo de 50', async (t) => {
+  t.mock.method(Content, 'findById', async () => ({ id: 1, title: 'Tarea' }));
+  const findCall = t.mock.method(TaskSubmission, 'findPaginatedByContent', async () => ({ rows: [], total: 0 }));
+
+  const req = mockReq({ params: { id: 1 }, query: { page: '2', limit: '9999' } });
+  const res = mockRes();
+  await submissionController.listSubmissions(req, res);
+
+  assert.deepEqual(findCall.mock.calls[0].arguments, [1, { page: 2, limit: 50 }]);
+});

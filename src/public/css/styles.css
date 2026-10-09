@@ -1,0 +1,1105 @@
+/* =================================
+   Estilos personalizados LMS LANBA - CeNAT
+   ================================= */
+
+:root {
+    /* Verde tomado directamente del logo de LANBA (#007031). */
+    --cenat-green: #007031;
+    --cenat-green-light: #22c55e;
+    --cenat-green-hover: #005c28;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+html {
+    scroll-behavior: smooth;
+}
+
+/* =================================
+   TEXTO LARGO SIN ESPACIOS
+   Títulos, descripciones, posts de foro y nombres los escribe la gente, y
+   a veces traen una "palabra" larguísima: una URL pegada, un nombre de
+   archivo con guiones bajos. Un contenedor normal no la parte y la página
+   entera se ensancha (medido: un foro con URLs de 300 caracteres quedaba de
+   2.490 px en una ventana de 1.039 px). `overflow-wrap: break-word` la
+   parte SOLO cuando no cabe y no toca el ancho mínimo del elemento, así que
+   no cambia el comportamiento de tablas ni de layouts flex con texto
+   normal. `select` con `max-width` evita lo mismo con una <option> larga
+   (un select mide lo que su opción más ancha).
+   ================================= */
+
+p, h1, h2, h3, h4, h5, h6, li, label, summary, blockquote, dd {
+    overflow-wrap: break-word;
+}
+
+select {
+    max-width: 100%;
+}
+
+/* Celdas de tabla: `break-word` solo no alcanza, porque en una tabla de
+   layout automático el ancho mínimo de la columna sigue siendo el de la
+   palabra más larga — por eso el tope de ancho (una celda normal nunca lo
+   alcanza, así que nada cambia para datos comunes; una con una "palabra"
+   de 150 caracteres se parte a 28rem en vez de estirar la tabla a 2.300 px
+   y mandar la columna de acciones fuera de la pantalla). NO se usa
+   `overflow-wrap: anywhere` acá a propósito: encoge las columnas hasta 1
+   carácter y en una pantalla angosta parte nombres y correos normales
+   letra por letra (probado a 1.024 px: filas de 145 px en vez de 73). */
+td {
+    overflow-wrap: break-word;
+    max-width: 28rem;
+}
+
+/* =================================
+   BORDES - MODO CLARO
+   Los grises por defecto de Tailwind (gray-100/200 ≈ #f3f4f6/#e5e7eb)
+   casi no contrastan contra fondos blancos/gray-50, así que el sidebar,
+   el navbar y las tablas del admin se ven "flotando" sin límites
+   definidos. Se oscurecen aquí para que se note la separación real —
+   con un tinte cálido (tostado/ámbar) en vez de gris neutro, igual que
+   el resto de la paleta cálida de más abajo (FONDOS - MODO CLARO).
+   ================================= */
+
+.border-gray-100 { border-color: #ddd2a8 !important; }
+.border-gray-200 { border-color: #c3b273 !important; }
+.border-b        { border-bottom-color: #c3b273 !important; }
+.border-t        { border-top-color: #c3b273 !important; }
+
+/* =================================
+   CONTRASTE DEL TEXTO SECUNDARIO - MODO CLARO
+   `text-gray-400` (#9ca3af) da 2,54:1 sobre blanco y `text-gray-500`
+   (#6b7280) 4,39:1 sobre el fondo de página (#f3f4f6): las pistas, los
+   "(1 punto)", los correos entre paréntesis y los subtítulos quedaban por
+   debajo del mínimo WCAG AA (4,5:1). Se oscurecen lo justo: 400 = #656d7b
+   (5,2 sobre blanco / 4,7 sobre #f3f4f6) y 500 = #5f6877 (5,6 / 5,1). Van
+   después de Tailwind (styles.css carga al final), y los estados hover
+   (hover:text-red-500 en botones de ícono, etc.) siguen ganando por
+   especificidad.
+   ::placeholder — el gris por defecto del navegador/Tailwind daba 2,54:1.
+   ================================= */
+
+.text-gray-400 { color: #656d7b; }
+.text-gray-500 { color: #5f6877; }
+
+/* input::placeholder (no ::placeholder a secas): la base de Tailwind ya
+   define `input::placeholder, textarea::placeholder` con el gris de 2,54:1, y
+   un selector de menor especificidad no la pisaría. */
+input::placeholder,
+textarea::placeholder {
+    color: #6b7280; /* 4,8:1 sobre blanco */
+    opacity: 1;
+}
+
+/* El navbar no trae ancho de borde propio (solo shadow-md), así que el
+   color de arriba no alcanza a mostrarse: se define el borde completo. */
+#navbar {
+    border-bottom: 1px solid #c3b273;
+}
+
+/* Los links de texto del navbar (Inicio/Mis Cursos/Administración/Iniciar
+   sesión, y el botón de idioma, que comparte la misma clase) solo cambiaban
+   de color de texto al pasar el mouse — Mauricio lo reportó como "no se
+   remarca" al ver la paleta cálida en vivo. Solo fondo + radio, SIN padding
+   ni margen: un primer intento con padding+margen negativo (para agrandar
+   el área con fondo sin mover el texto) chocaba con el margin-left que ya
+   pone Tailwind "space-x-6" en cada link — mismo nombre de propiedad, la
+   regla de acá ganaba por especificidad y lo reemplazaba por completo en
+   vez de sumarse, juntando los links entre sí hasta superponerlos al pasar
+   el mouse. Sin tocar padding/margen no hay ese riesgo. No afecta modo
+   oscuro: el color de fondo elegido es un verde pálido fijo, no una de las
+   clases bg-gray-* que cambiaron con la paleta cálida. */
+#navbar a.hover\:text-cenat-green:hover,
+#navbar button.hover\:text-cenat-green:hover {
+    background-color: #e6f4ea;
+    border-radius: 0.375rem;
+}
+
+.dark #navbar a.hover\:text-cenat-green:hover,
+.dark #navbar button.hover\:text-cenat-green:hover {
+    background-color: #1e293b;
+}
+
+/* =================================
+   FONDOS - MODO CLARO (paleta cálida)
+   El fondo de página (bg-gray-100, #f3f4f6 de Tailwind) y las tarjetas
+   blancas quedaban demasiado parecidas entre sí, y el botón secundario
+   "Cancelar" (bg-gray-100, sin override hasta ahora) era literalmente el
+   mismo color que el fondo de la página — invisible salvo por el borde.
+   Paleta "Verde-cálido LANBA" elegida por Mauricio entre 3 propuestas
+   mostradas en vivo (ver memoria de sesión): un crema/tostado que separa
+   fondo/tarjeta/borde/botón secundario sin competir con el verde de marca
+   (--cenat-green) ni tocar el modo oscuro, que ya estaba resuelto.
+   ================================= */
+
+/* El <body> lleva literalmente la clase "bg-gray-100" (igual que el botón
+   secundario "Cancelar" de varios formularios de admin) — un solo valor
+   cubre los dos casos, sin !important: styles.css carga después de
+   Tailwind, así que esta regla ya le gana a la utilidad propia de
+   Tailwind por orden de aparición, misma especificidad (1 clase). */
+.bg-gray-100 { background-color: #f3f0e2; }
+.bg-gray-50  { background-color: #f8f5ea !important; }
+
+/* bg-gray-200/300 no tenían override hasta ahora (quedaban en el gris
+   plano de Tailwind, #e5e7eb/#d1d5db) — son el fondo normal/hover del
+   botón secundario "Cancelar" en varios formularios. */
+.bg-gray-200            { background-color: #e6dba3 !important; }
+.bg-gray-300,
+.hover\:bg-gray-200:hover,
+.hover\:bg-gray-300:hover { background-color: #d4c184 !important; }
+
+/* En modo claro, el fondo de página (bg-gray-100) y las tarjetas blancas
+   (bg-white) quedaban demasiado parecidas entre sí — con el borde
+   oscurecido de arriba ya se notaba el límite, pero apenas. Una sombra
+   sutil despega la tarjeta del fondo sin necesidad de tocar cada template
+   que usa "bg-white rounded-xl" (~15 lugares distintos). En modo oscuro no
+   hace falta: ahí el contraste ya viene de los colores, no de sombras. */
+.bg-white.rounded-xl {
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04) !important;
+}
+
+.dark .bg-white.rounded-xl {
+    box-shadow: none !important;
+}
+
+/* =================================
+   FONDO DE PANTALLAS DE AUTENTICACIÓN
+   (login, registro, olvidé/restablecer contraseña)
+   ================================= */
+
+.auth-bg {
+    position: relative;
+    /* z-index propio (no solo position:relative) para que este elemento
+       forme su propio contexto de apilamiento — si no, el ::before con
+       z-index:-1 de abajo se apila en el contexto del ANCESTRO más cercano
+       que sí forme uno (ej. <body>), quedando por detrás de la propia
+       imagen de fondo de este mismo elemento en vez de encima de ella, y
+       el velo oscuro nunca se ve. */
+    z-index: 0;
+    background-image: url('/images/imagenfondo.png');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+
+/* Velo verde oscuro para que la tarjeta blanca resalte y el texto/logo
+   de la imagen no compita con el logo real de la tarjeta. z-index -1
+   lo mantiene por encima de la imagen de fondo pero debajo de la tarjeta.
+   Opacidad baja a propósito (antes 0.82/0.68) — con el z-index arreglado
+   este velo se empezó a ver por primera vez, y quedaba más oscuro de lo
+   que a Mauricio le gustaba; la imagen debe seguir viéndose vívida, solo
+   un poco atenuada. */
+.auth-bg::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background: linear-gradient(135deg, rgba(0, 41, 18, 0.35), rgba(0, 92, 40, 0.25));
+}
+
+/* =================================
+   FONDO DETRÁS DE LA GRILLA DE CURSOS
+   (catálogo, "Mis Cursos", y el detalle de un curso) — prueba visual con
+   imagenambiente.png.
+   Mismo mecanismo que .auth-bg: imagen de fondo + velo semitransparente
+   para que las tarjetas y el texto sigan siendo legibles encima. Mauricio
+   pidió el MISMO velo oscuro en los dos modos (antes el de modo claro era
+   un crema que dejaba ver la foto mucho más "viva" que el de modo oscuro)
+   — por eso una sola regla sin `.dark`, en vez de dos tonos distintos.
+   Esto deja oscuro el fondo incluso en modo claro, así que el puñado de
+   texto que queda EXPUESTO directo sobre el velo (no dentro de una tarjeta
+   blanca/verde propia) necesita pasar a un color claro acá abajo — nada
+   dentro de una tarjeta (bg-white, bg-green-50, etc.) se ve afectado,
+   porque esas tarjetas son opacas y tapan el velo por su cuenta.
+   ================================= */
+
+.courses-bg {
+    position: relative;
+    /* z-index propio, mismo motivo que en .auth-bg: sin esto el velo
+       ::before (z-index:-1) se apila fuera de este elemento y queda
+       tapado por su propia imagen de fondo. */
+    z-index: 0;
+    /* #app tiene min-h-screen (fuerza que la página mida al menos el alto
+       de la pantalla), pero este contenedor solo medía lo que ocupa su
+       propio contenido (encabezado + grilla) — si hay pocos cursos, queda
+       más corto que la pantalla y el resto se ve con el color plano de
+       fondo (la "franja" reportada). min-height: 100vh hace que la imagen
+       siempre llegue hasta el final, sin importar cuántos cursos haya. */
+    min-height: 100vh;
+    background-image: url('/images/imagenambiente.png');
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
+}
+
+.courses-bg::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background: rgba(30, 41, 59, 0.6);
+}
+
+/* Texto expuesto directo sobre el velo (ver nota arriba): los 3 títulos
+   "Cursos disponibles" / "Videos del curso" / "Contenido" (siempre
+   text-gray-900 + ícono text-cenat-green en su versión de modo claro) y la
+   paginación de catálogo/Mis Cursos. Mismos tonos que ya usa el propio
+   modo oscuro para estos casos (.dark .text-gray-900 / .text-cenat-green),
+   reusados acá para que se vean igual sin depender de la clase `.dark`.
+   `.courses-bg-heading` (NO ".courses-bg h2" a secas): la tarjeta de "Mis
+   Cursos" también usa un <h2> para el título del curso, dentro de su
+   propia tarjeta blanca — un selector por tag+ancestro lo agarraba a él
+   también y lo dejaba casi blanco sobre blanco, invisible. Una clase
+   puesta a mano solo en los 3 títulos reales evita ese choque. */
+.courses-bg-heading {
+    color: #f1f5f9;
+}
+
+.courses-bg-heading i {
+    color: #86efac;
+}
+
+.courses-bg nav {
+    color: #cbd5e1;
+}
+
+.courses-bg .pagination-btn {
+    color: #cbd5e1;
+}
+
+.courses-bg .pagination-btn:hover:not(:disabled) {
+    background-color: #475569 !important;
+}
+
+/* =================================
+   DARK MODE
+   ================================= */
+
+/* Body y fondo general.
+   Toda la escala neutra oscura se desplazó un paso hacia arriba (900->800,
+   800->700, etc.) respecto a la versión anterior: antes el fondo de página
+   (#0f172a) quedaba casi idéntico a fondos secundarios (bg-gray-50) y muy
+   poco diferenciado de las tarjetas, además de ser un negro demasiado
+   oscuro para las horas de lectura larga. Moviendo toda la escala junto se
+   preservan las mismas relaciones relativas entre capas, solo más claras. */
+.dark body {
+    color: #e2e8f0;
+}
+
+/* El <body> lleva literalmente la clase "bg-gray-100" (ver index.html),
+   así que la regla genérica ".dark .bg-gray-100" (2 clases, !important) de
+   más abajo le gana en especificidad a un simple ".dark body" (1 clase +
+   1 elemento) aunque también tenga !important — eso hacía que el fondo de
+   página terminara mostrando el color de TARJETA (#334155) en vez del
+   fondo de página (#1e293b), justo el problema de contraste que se quería
+   arreglar. "body.bg-gray-100" agrega una clase más a la selección
+   (2 clases + 1 elemento) para ganarle a la regla genérica sin tocar el
+   valor que usan los demás elementos que comparten esa misma clase
+   (botones secundarios, cajas de placeholder). */
+.dark body.bg-gray-100 {
+    background-color: #1e293b !important;
+}
+
+/* Navbar */
+.dark #navbar {
+    background-color: #334155;
+    border-bottom: 1px solid #475569;
+}
+
+.dark #navbar a,
+.dark #navbar button,
+.dark #navbar span {
+    color: #cbd5e1;
+}
+
+.dark #navbar a:hover {
+    color: #86efac;
+}
+
+/* Logo */
+.dark .text-cenat-green {
+    color: #86efac;
+}
+
+/* Footer */
+.dark footer {
+    background-color: #334155;
+    border-top-color: #475569;
+}
+
+.dark footer p {
+    color: #b4c0d0; /* antes #94a3b8: 4,04:1 sobre el fondo del footer */
+}
+
+/* Tarjetas blancas */
+.dark .bg-white {
+    background-color: #334155 !important;
+    color: #e2e8f0;
+}
+
+/* Textos grises.
+   Los tres últimos (600/500/400) son el texto SECUNDARIO: descripciones,
+   nombre del profesor, "0 contenidos", fechas de las tablas, pistas. Antes
+   valían #94a3b8 / #64748b / #475569 y sobre la tarjeta (#334155) daban
+   4,04:1 / 2,18:1 / 1,37:1 — el mínimo WCAG AA para texto normal es 4,5:1, y
+   los dos últimos casi no se leían. Nuevos valores (calculados, no
+   estimados; sobre #334155 / #1e293b / #14432a): 600 = #b4c0d0 (5,6 / 7,9 /
+   6,1), 500 = #a9b6ca (5,0 / 7,1 / 5,5), 400 = #a0aec0 (4,6 / 6,5 / 5,0).
+   Se mantiene el orden de jerarquía (900 > 800 > 700 > 600 > 500 > 400). */
+.dark .text-gray-900 { color: #f1f5f9 !important; }
+.dark .text-gray-800 { color: #e2e8f0 !important; }
+.dark .text-gray-700 { color: #cbd5e1 !important; }
+.dark .text-gray-600 { color: #b4c0d0 !important; }
+.dark .text-gray-500 { color: #a9b6ca !important; }
+.dark .text-gray-400 { color: #a0aec0 !important; }
+/* Las variantes `dark:text-slate-*` de Tailwind (#94a3b8 y #64748b) tienen
+   el mismo problema cuando van solas en un elemento, sin su text-gray-*. */
+.dark .dark\:text-slate-400 { color: #b4c0d0 !important; }
+.dark .dark\:text-slate-500 { color: #a0aec0 !important; }
+
+/* bg-gray-200/300 ganaron un override cálido en modo claro (ver FONDOS -
+   MODO CLARO más arriba) que, sin esto, se colaba también acá: ninguno de
+   los dos tenía antes una regla ".dark" propia (algunos botones
+   secundarios, ej. "Cancelar", no llevan variante dark: en su className),
+   así que se restauran al gris plano de Tailwind que ya mostraban antes
+   de este cambio — el modo oscuro no se toca. */
+.dark .bg-gray-200 { background-color: #e5e7eb !important; }
+.dark .bg-gray-300,
+.dark .hover\:bg-gray-200:hover,
+.dark .hover\:bg-gray-300:hover { background-color: #d1d5db !important; }
+
+/* Bordes */
+.dark .border-gray-100 { border-color: #475569 !important; }
+.dark .border-gray-200 { border-color: #475569 !important; }
+.dark .border-gray-300 { border-color: #64748b !important; }
+.dark .border-t { border-top-color: #475569 !important; }
+.dark .border-b { border-bottom-color: #475569 !important; }
+
+/* Card de "Información del curso" (bg-green-50 border-green-100): el borde
+   no tenía override en modo oscuro y quedaba con el verde clarísimo por
+   defecto de Tailwind, casi invisible contra el fondo verde oscuro. */
+.dark .border-green-100 { border-color: #2f6b4a !important; }
+
+/* Fondos secundarios */
+.dark .bg-gray-50  { background-color: #1e293b !important; }
+.dark .bg-gray-100 { background-color: #334155 !important; }
+.dark .bg-green-50 { background-color: #14432a !important; }
+
+/* Inputs y textareas */
+.dark input,
+.dark textarea,
+.dark select {
+    background-color: #1e293b !important;
+    border-color: #64748b !important;
+    color: #e2e8f0 !important;
+}
+
+/* #a9b6ca: 5,0:1 sobre #334155 (los buscadores del admin son bg-white, que
+   en oscuro pasa a #334155) y 7,1:1 sobre #1e293b. Antes #94a3b8: 4,04:1. */
+.dark input::placeholder,
+.dark textarea::placeholder {
+    color: #a9b6ca !important;
+}
+
+/* Tablas */
+.dark thead,
+.dark .bg-gray-50 { background-color: #1e293b !important; }
+.dark tr:hover   { background-color: #14432a !important; }
+.dark th         { color: #94a3b8 !important; }
+
+/* Sidebar admin */
+.dark aside {
+    background-color: #334155 !important;
+    border-right-color: #475569 !important;
+}
+
+/* Dropdown user menu */
+.dark #user-dropdown {
+    background-color: #334155 !important;
+    border: 1px solid #475569;
+}
+
+.dark #user-dropdown a,
+.dark #user-dropdown button {
+    color: #cbd5e1 !important;
+}
+
+.dark #user-dropdown a:hover,
+.dark #user-dropdown button:hover {
+    background-color: #1e293b !important;
+}
+
+/* Cards de estadísticas */
+.dark .rounded-xl { --tw-shadow: none; }
+
+/* Zona de drop de archivos */
+.dark .file-drop-zone {
+    border-color: #64748b;
+    background-color: #1e293b;
+    color: #94a3b8;
+}
+
+.dark .file-drop-zone:hover,
+.dark .file-drop-zone.dragging {
+    border-color: #22c55e;
+    background-color: #14432a;
+}
+
+/* Toast */
+.dark #toast > div {
+    background-color: #1e293b !important;
+    color: #e2e8f0;
+}
+
+/* Mobile menu */
+.dark #mobile-menu {
+    background-color: #1e293b;
+}
+
+/* Formulario de login/register */
+.dark .shadow-2xl {
+    box-shadow: 0 25px 50px rgba(0, 0, 0, 0.6) !important;
+}
+
+.dark .auth-bg::before {
+    background: linear-gradient(135deg, rgba(2, 12, 6, 0.55), rgba(0, 41, 18, 0.45));
+}
+
+/* =================================
+   ANIMACIONES
+   ================================= */
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in { animation: fadeIn 0.3s ease-in-out; }
+
+/* =================================
+   TARJETAS DE CURSOS
+   ================================= */
+
+.course-card {
+    transition: all 0.3s ease;
+    cursor: pointer;
+}
+
+.course-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
+}
+
+.dark .course-card:hover {
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+}
+
+.course-card img { transition: transform 0.3s ease; }
+.course-card:hover img { transform: scale(1.05); }
+
+/* Enlace REAL superpuesto a toda la tarjeta (ver renderCourseCardShell en
+   utils.js): Tab lo enfoca, Enter lo abre y un lector de pantalla lo anuncia
+   como enlace con el título del curso. z-index 1 lo pone encima del
+   contenido de la tarjeta; lo interactivo de dentro ("Leer más") sube a 2
+   para seguir siendo clickeable. */
+.course-card-link {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    border-radius: inherit;
+}
+
+.course-card .expandable-text-toggle {
+    position: relative;
+    z-index: 2;
+}
+
+/* Foco visible sobre CUALQUIER fondo (la tarjeta mezcla una portada verde,
+   una zona blanca y, en modo oscuro, una zona slate): anillo de dos tonos,
+   oscuro por fuera y blanco por dentro — uno de los dos siempre contrasta. */
+.course-card-link:focus-visible {
+    outline: 3px solid #ffffff;
+    outline-offset: -6px;
+    box-shadow: inset 0 0 0 3px #0f172a;
+}
+
+/* =================================
+   ENCABEZADOS "HÉROE" (portada y detalle de curso)
+   Llevan texto blanco / verde claro encima. El degradado anterior
+   (from-cenat-green to-cenat-green-light, #007031 -> #22c55e) terminaba en un
+   verde tan claro que el texto quedaba entre 2,2 y 3,0:1 en su extremo
+   (descripción, nombre del profesor, progreso; mínimo WCAG AA: 4,5:1). Este
+   termina en #08703a: blanco 6,2:1, verde-100 5,6:1, verde-200 5,1:1 en el
+   peor punto — y el inicio (#005c28, el verde "hover" de la marca) da todavía
+   más contraste. Los demás degradados de la app (miniaturas, avatar) solo
+   llevan un ícono y no cambian.
+   ================================= */
+
+.hero-gradient {
+    background-image: linear-gradient(135deg, #005c28 0%, #08703a 100%);
+}
+
+/* =================================
+   BOTONES
+   ================================= */
+
+.btn-cenat {
+    /* El degradado terminaba en --cenat-green-light (#22c55e): el texto
+       blanco sobre ese extremo daba 2,3:1 (mínimo AA: 4,5:1). #0c863a da
+       4,7:1 con texto blanco y conserva el degradado, más sutil. */
+    background: linear-gradient(135deg, var(--cenat-green) 0%, #0c863a 100%);
+    color: white;
+    padding: 0.75rem 1.5rem;
+    border-radius: 0.5rem;
+    font-weight: 600;
+    transition: all 0.3s ease;
+    border: none;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+}
+
+.btn-cenat:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(0, 112, 49, 0.3);
+}
+
+.btn-cenat:active  { transform: translateY(0); }
+.btn-cenat:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* =================================
+   REPRODUCTOR DE VIDEO
+   ================================= */
+
+.video-player-container {
+    position: relative;
+    padding-top: 56.25%;
+    background: #000;
+    border-radius: 0.5rem;
+    overflow: hidden;
+}
+
+.video-player-container video,
+.video-player-container iframe {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    border: none;
+}
+
+/* =================================
+   BADGES
+   ================================= */
+
+.badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.25rem 0.75rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+/* Texto blanco sobre cada fondo, mínimo WCAG AA 4,5:1. Antes "Activo"
+   (#10b981) daba 2,54:1, "Estudiante" (#3b82f6) 3,68:1 y "Profesor"
+   (#8b5cf6) 4,23:1; ahora los tonos -700 de la misma familia: 5,5 / 6,7 /
+   7,1. Admin (4,83) e Inactivo (4,83) ya cumplían. */
+.badge-admin    { background: #dc2626; color: white; }
+.badge-teacher  { background: #6d28d9; color: white; }
+.badge-student  { background: #1d4ed8; color: white; }
+.badge-active   { background: #047857; color: white; }
+.badge-inactive { background: #6b7280; color: white; }
+
+/* =================================
+   PROGRESS BAR
+   ================================= */
+
+.progress-bar {
+    width: 100%;
+    height: 8px;
+    background: #e5e7eb;
+    border-radius: 9999px;
+    overflow: hidden;
+}
+
+.dark .progress-bar { background: #475569; }
+
+.progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--cenat-green), var(--cenat-green-light));
+    transition: width 0.3s ease;
+}
+
+/* =================================
+   SPINNER
+   ================================= */
+
+.spinner {
+    border: 3px solid #f3f3f3;
+    border-top: 3px solid var(--cenat-green);
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    animation: spin 1s linear infinite;
+}
+
+.dark .spinner { border-color: #475569; border-top-color: #22c55e; }
+
+@keyframes spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* =================================
+   TOAST
+   ================================= */
+
+.toast-success { border-left: 4px solid #10b981; }
+.toast-error   { border-left: 4px solid #ef4444; }
+.toast-warning { border-left: 4px solid #f59e0b; }
+.toast-info    { border-left: 4px solid #3b82f6; }
+
+/* =================================
+   EMPTY STATE
+   ================================= */
+
+.empty-state {
+    text-align: center;
+    padding: 3rem 1rem;
+}
+
+.empty-state i {
+    font-size: 4rem;
+    color: #d1d5db;
+    margin-bottom: 1rem;
+    display: block;
+}
+
+.dark .empty-state i { color: #475569; }
+
+/* =================================
+   FILE DROP ZONE
+   ================================= */
+
+.file-drop-zone {
+    border: 2px dashed #d1d5db;
+    border-radius: 0.5rem;
+    padding: 2rem;
+    text-align: center;
+    transition: all 0.3s ease;
+    cursor: pointer;
+}
+
+.file-drop-zone:hover,
+.file-drop-zone.dragging {
+    border-color: var(--cenat-green);
+    background: rgba(0, 112, 49, 0.05);
+}
+
+/* =================================
+   DARK MODE TOGGLE BUTTON
+   ================================= */
+
+#dark-mode-toggle {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    transition: background 0.2s;
+}
+
+#dark-mode-toggle:hover {
+    background: #f1f5f9;
+}
+
+.dark #dark-mode-toggle:hover {
+    background: #475569;
+}
+
+/* =================================
+   SCROLLBAR PERSONALIZADA
+   ================================= */
+
+.custom-scroll::-webkit-scrollbar        { width: 6px; }
+.custom-scroll::-webkit-scrollbar-track  { background: #f1f1f1; }
+.custom-scroll::-webkit-scrollbar-thumb  { background: #888; border-radius: 3px; }
+.custom-scroll::-webkit-scrollbar-thumb:hover { background: #555; }
+
+/* =================================
+   RESPONSIVE
+   ================================= */
+
+@media (max-width: 640px) {
+    .course-card  { margin-bottom: 1rem; }
+    .btn-cenat    { width: 100%; }
+}
+
+@media print {
+    nav, footer, .no-print { display: none !important; }
+}
+
+/* =================================
+   NAVEGACIÓN Y FOCO
+   ================================= */
+
+/* "Saltar al contenido": fuera de pantalla hasta que recibe el foco con Tab. */
+.skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0.5rem;
+    z-index: 100;
+    padding: 0.75rem 1.25rem;
+    border-radius: 0.5rem;
+    background: #007031;
+    color: #ffffff;
+    font-weight: 600;
+}
+
+.skip-link:focus {
+    left: 0.5rem;
+    outline: 3px solid #ffffff;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 6px #0f172a;
+}
+
+/* Título de la página nueva: recibe el foco por código al cambiar de ruta
+   (ver focusMainHeading en router.js); no es un control, no debe dibujar un
+   aro. Igual el contenedor principal tras "Saltar al contenido". */
+#app [tabindex="-1"]:focus,
+#app:focus {
+    outline: none;
+}
+
+/* Sección actual del menú (aria-current="page", ver updateNavCurrent).
+   NO aplica al botón verde "Regístrate" (.btn-cenat): estando en la página de
+   registro ese enlace es el "actual", y pintarlo de verde lo dejaba verde
+   sobre verde (1,08:1). */
+#navbar a[aria-current="page"]:not(.btn-cenat) {
+    color: var(--cenat-green);
+    font-weight: 600;
+}
+
+.dark #navbar a[aria-current="page"]:not(.btn-cenat) {
+    color: #86efac;
+}
+
+/* El botón verde del navbar conserva su texto blanco en modo oscuro: la regla
+   general `.dark #navbar a` (gris claro) lo dejaba en ~3,4:1 sobre el verde, y
+   `.dark #navbar a:hover` (verde claro) casi ilegible al pasar el mouse. */
+.dark #navbar a.btn-cenat,
+.dark #navbar a.btn-cenat:hover,
+.dark #navbar a.btn-cenat span {
+    color: #ffffff;
+}
+
+/* Zonas de subida de portada: ahora son botones enfocables (ver
+   setupThumbnailDropZone en utils.js). */
+.file-drop-zone:focus-visible {
+    outline: 3px solid var(--cenat-green);
+    outline-offset: 2px;
+}
+
+.dark .file-drop-zone:focus-visible {
+    outline-color: #86efac;
+}
+
+/* Error de validación junto al campo (ver showFieldError en utils.js).
+   #b91c1c: 6,5:1 sobre blanco; #fca5a5 en oscuro: 5,5:1 sobre #334155. */
+.field-error {
+    color: #b91c1c;
+}
+
+.dark .field-error {
+    color: #fca5a5;
+}
+
+input[aria-invalid="true"] {
+    border-color: #dc2626;
+}
+
+.dark input[aria-invalid="true"] {
+    border-color: #fca5a5 !important;
+}
+
+/* Emoji del modal "curso completado": rebota 3 veces y se detiene (antes un
+   animate-bounce infinito: movimiento permanente mientras el modal siga
+   abierto). */
+@keyframes completionBounce {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-25%); }
+}
+
+.completion-emoji {
+    display: inline-block;
+    animation: completionBounce 0.9s ease-in-out 3;
+}
+
+/* =================================
+   OBJETIVOS TÁCTILES (móvil y pantallas táctiles)
+   Medido en 375 px: los botones de solo ícono (editar, eliminar, descargar,
+   desvincular...) medían 12-31 px de ancho por 16-24 de alto, con
+   "Editar profesores" pegado a "Desvincular del módulo" — un toque fallido
+   borra o desvincula. WCAG 2.2 pide 24 px como mínimo (2.5.8); 40-44 px es
+   lo que un dedo toca cómodo. Un solo selector cubre TODOS los botones y
+   enlaces cuyo único hijo es un <i> (patrón que usa toda la app), en vez de
+   tocar cada plantilla.
+   Se excluyen: los que ya crecen con `-m-2` (cierre del toast y de los
+   modales), los botones de subir/bajar (van apilados; ver .reorder-btn) y el
+   enlace superpuesto de las tarjetas de curso.
+   ================================= */
+
+/* Base (TODOS los tamaños de pantalla): mínimo WCAG 2.2 AA (2.5.8) de 24 px.
+   En escritorio los botones de solo ícono medían 16-20 px de alto; los ↑↓
+   apilados y el botón de acceso admin pegado al selector de rol de la tabla
+   de usuarios no pasaban ni siquiera la excepción por espaciado. */
+button:has(> i:only-child):not(.reorder-btn):not(.\-m-2),
+a:has(> i:only-child):not(.course-card-link),
+.reorder-btn {
+    min-width: 24px;
+    min-height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+@media (max-width: 640px), (pointer: coarse) {
+    button:has(> i:only-child):not(.reorder-btn):not(.\-m-2),
+    a:has(> i:only-child):not(.course-card-link) {
+        min-width: 40px;
+        min-height: 40px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    /* Agarradera de arrastre del gestor de contenido: el arrastre HTML5 no
+       funciona con el dedo en los navegadores móviles, y las flechas subir/
+       bajar (renderReorderButtons) existen justamente como alternativa. En un
+       curso con carpetas cada nivel de anidación gastaba ~90 px entre
+       agarradera y flechas, y las filas quedaban en ~118 px de ancho. */
+    .drag-handle {
+        display: none;
+    }
+
+    /* Subir/bajar: dos botones apilados; 40 px cada uno serían 80 px de alto. */
+    .reorder-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 36px;
+        min-height: 26px;
+    }
+
+    .pagination-btn {
+        min-width: 40px;
+        min-height: 40px;
+    }
+
+    /* Enlaces "← Volver" (ícono de flecha + texto) y botones de texto: 20 px de alto. */
+    a:has(> i.fa-arrow-left) {
+        display: inline-flex;
+        align-items: center;
+        min-height: 40px;
+    }
+
+    .expandable-text-toggle,
+    button.text-left {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+    }
+
+    /* Check de "completado" del estudiante (la interacción principal del curso):
+       se ve de 24 px, pero la zona de toque llega a 40 px con un pseudo-elemento
+       invisible — sin cambiar cómo se ve ni empujar el título. */
+    .content-checkbox {
+        position: relative;
+    }
+
+    .content-checkbox::after {
+        content: '';
+        position: absolute;
+        inset: -8px;
+    }
+
+    /* Selector de rol de la tabla de usuarios (una "píldora" de 26 px de alto). */
+    select.badge {
+        min-height: 32px;
+    }
+}
+
+/* Barra superior en teléfonos y tablets (menú hamburguesa, < lg): cada control
+   a 44 px. Caben los cuatro más el logo desde 320 px de ancho. */
+@media (max-width: 1023.98px) {
+    /* #navbar delante: la regla base de .text-size-btn está más abajo en este
+       archivo y, con la misma especificidad, le ganaría a esta. */
+    #navbar .text-size-btn {
+        width: 44px;
+        height: 44px;
+    }
+
+    #dark-mode-toggle-mobile,
+    #mobile-menu-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 44px;
+        min-height: 44px;
+    }
+
+    #language-menu-button-mobile {
+        min-height: 44px;
+        padding-inline: 0.5rem;
+    }
+}
+
+/* Filas del gestor de contenido (contenido, tarea, cuestionario, foro,
+   carpeta, módulo, curso hijo): ícono + título + 2-3 botones en una sola línea
+   dejaban el título en ~95 px ("M…", "Fundament…") al agrandar los botones.
+   En pantallas angostas la fila se parte: el título ocupa su propia línea (al
+   menos 8 rem) y los botones pasan a una segunda, alineados a la derecha. */
+@media (max-width: 640px) {
+    .manager-row {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        row-gap: 0.25rem;
+    }
+
+    .manager-row > .flex-1,
+    .manager-row > .manager-row-title {
+        flex: 1 1 8rem;
+        min-width: 0;
+    }
+
+    /* Si el ícono/miniatura queda solo en su línea (fila muy angosta por la
+       anidación de carpetas), va a la izquierda y no pegado a los botones. */
+    .manager-row > i:first-child,
+    .manager-row > img:first-child {
+        margin-right: auto;
+    }
+
+    /* Encabezado de módulo/carpeta (<summary>): el "(2 cursos)" y la insignia
+       del profesor pasan a una segunda línea antes de recortar el título con
+       "…". (No aplica a la fila de curso hijo, donde el título ya vive en su
+       propio bloque junto a la miniatura.) */
+    summary.manager-row > .manager-row-title {
+        flex-wrap: wrap;
+        row-gap: 0.125rem;
+    }
+}
+
+/* =================================
+   MOVIMIENTO REDUCIDO
+   Preferencia del sistema operativo (vestibular, fotosensibilidad...). Se
+   quitan el desplazamiento suave, el rebote/aparición, el confeti (ver
+   launchConfetti) y el "salto" de tarjetas y botones al pasar el mouse.
+   NO se tocan los spinners de carga: esos comunican que algo está pasando,
+   y congelarlos dejaría al usuario sin ninguna señal de progreso.
+   ================================= */
+
+@media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+
+    .fade-in,
+    .animate-bounce,
+    .completion-emoji { animation: none; }
+
+    .course-card,
+    .course-card img,
+    .btn-cenat { transition: none; }
+
+    .course-card:hover,
+    .course-card:hover img,
+    .btn-cenat:hover { transform: none; }
+}
+
+/* =================================
+   CONFETTI ANIMATION
+   ================================= */
+
+@keyframes confettiFall {
+    0%   { transform: translateY(0) rotate(0deg); opacity: 1; }
+    100% { transform: translateY(100vh) rotate(720deg); opacity: 0; }
+}
+
+/* =================================
+   MODAL OVERLAY
+   ================================= */
+
+#completion-modal .backdrop-blur-sm {
+    backdrop-filter: blur(4px);
+}
+
+/* =================================
+   TEXTO MÁS GRANDE (ACCESIBILIDAD)
+   Control +/- para el usuario (botones "A-"/"A+" en la barra de
+   navegación, ver textsize.js): 2 niveles de aumento, aplicados como
+   clase en <html> (mismo mecanismo que el modo oscuro) — así cubre TODO
+   el sitio automáticamente, no solo login/curso como en la primera
+   versión de este control. Las clases text-* de Tailwind usan rem, que
+   se calcula contra el font-size del <html> raíz, no del ancestro más
+   cercano — por eso hace falta sobreescribir cada clase text-* en vez de
+   solo cambiar el font-size de <html> (eso además escalaría paddings y
+   márgenes, que también usan rem, y rompería el layout).
+   ================================= */
+
+.text-boost-1 .text-xs  { font-size: 0.85rem !important; }
+.text-boost-1 .text-sm  { font-size: 0.95rem !important; }
+.text-boost-1 .text-base { font-size: 1.1rem !important; }
+.text-boost-1 .text-lg  { font-size: 1.25rem !important; }
+.text-boost-1 .text-xl  { font-size: 1.4rem !important; }
+.text-boost-1 .text-2xl { font-size: 1.65rem !important; }
+.text-boost-1 .text-3xl { font-size: 2rem !important; }
+.text-boost-1 p, .text-boost-1 label, .text-boost-1 li { font-size: 1.05rem; }
+.text-boost-1 input, .text-boost-1 textarea { font-size: 1.05rem; }
+
+.text-boost-2 .text-xs  { font-size: 0.95rem !important; }
+.text-boost-2 .text-sm  { font-size: 1.05rem !important; }
+.text-boost-2 .text-base { font-size: 1.2rem !important; }
+.text-boost-2 .text-lg  { font-size: 1.4rem !important; }
+.text-boost-2 .text-xl  { font-size: 1.6rem !important; }
+.text-boost-2 .text-2xl { font-size: 1.9rem !important; }
+.text-boost-2 .text-3xl { font-size: 2.3rem !important; }
+.text-boost-2 p, .text-boost-2 label, .text-boost-2 li { font-size: 1.15rem; }
+.text-boost-2 input, .text-boost-2 textarea { font-size: 1.15rem; }
+
+/* Botones "A-"/"A+" — mismo tamaño/estilo que #dark-mode-toggle. */
+.text-size-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    font-weight: 700;
+    font-size: 0.7rem;
+    color: #4b5563;
+    transition: background 0.2s;
+}
+
+.text-size-btn:hover:not(:disabled) { background: #f1f5f9; }
+.dark .text-size-btn { color: #cbd5e1; }
+.dark .text-size-btn:hover:not(:disabled) { background: #475569; }
+.text-size-btn:disabled { opacity: 0.35; cursor: not-allowed; }

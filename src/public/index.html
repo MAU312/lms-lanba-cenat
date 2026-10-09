@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LMS LANBA - CeNAT (Centro Nacional de Alta Tecnología)</title>
+    <link rel="icon" type="image/png" href="/images/logo-lanba-icono.png">
+
+    <!-- Aplicar dark mode/tamaño de letra guardados ANTES de pintar la
+         página, para no arrancar con el tema por defecto y saltar un
+         instante después. -->
+    <script>
+        // localStorage puede lanzar (modo privado estricto, política de la
+        // organización que lo bloquea) — sin el try/catch, esa excepción
+        // frenaba el parseo del <head> antes de llegar a cargar el CSS/los
+        // scripts de abajo.
+        try {
+            if (localStorage.getItem('darkMode') === 'true' ||
+                (localStorage.getItem('darkMode') === null && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                document.documentElement.classList.add('dark');
+            }
+
+            const savedTextSizeLevel = parseInt(localStorage.getItem('textSizeLevel'), 10);
+            if (savedTextSizeLevel > 0) {
+                document.documentElement.classList.add(`text-boost-${Math.min(savedTextSizeLevel, 2)}`);
+            }
+        } catch (e) { /* sin localStorage: arranca con los valores por defecto */ }
+    </script>
+
+    <!-- Tailwind CSS compilado en build time (ver tailwind.config.js y
+         "npm run build:css"/"watch:css") — antes se cargaba desde el CDN
+         "Play" en tiempo de ejecución. -->
+    <link rel="stylesheet" href="/css/tailwind.css">
+
+    <!-- Font Awesome Free 6.4.0 servido desde el propio servidor (antes cdnjs).
+         Si la red del hosting bloqueaba el CDN, TODOS los íconos desaparecían,
+         y con ellos los botones de solo ícono (editar, eliminar, menú...). Solo
+         se incluye la familia "solid" (la única que usa la app: `fas`); ver
+         vendor/fontawesome/LICENSE.txt (íconos CC BY 4.0, fuentes OFL 1.1,
+         código MIT). -->
+    <link rel="stylesheet" href="/vendor/fontawesome/css/fontawesome.min.css">
+    <link rel="stylesheet" href="/vendor/fontawesome/css/solid.min.css">
+
+    <!-- CSS personalizado -->
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+
+<body class="bg-gray-100 dark:bg-slate-800 min-h-screen transition-colors duration-300">
+
+    <!-- Primer elemento enfocable: un usuario de teclado se salta el navbar de
+         un Tab. Es un botón y no un <a href="#..."> porque el router usa el hash. -->
+    <button type="button" class="skip-link" onclick="skipToContent()" data-i18n="nav.skip_to_content">Saltar al contenido</button>
+
+    <!-- Navbar -->
+    <nav id="navbar" class="bg-white dark:bg-slate-800 shadow-md hidden transition-colors duration-300">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <!-- Logo -->
+                <div class="flex items-center min-w-0">
+                    <!-- En teléfonos (< 640 px) solo el logo: el título no cabía junto a
+                         los 4 controles de la derecha (se veía como "LMS LANBA …") y
+                         esos controles necesitan 44 px cada uno para tocarse bien.
+                         aria-label conserva el nombre para lectores de pantalla. -->
+                    <a href="#/" class="flex items-center space-x-2 min-w-0" aria-label="LMS LANBA - CeNAT">
+                        <img src="/images/logo-lanba-icono.png" alt="" class="h-8 w-8 object-contain flex-shrink-0">
+                        <span class="hidden sm:inline font-bold text-lg md:text-xl text-cenat-green truncate">LMS LANBA - CeNAT</span>
+                    </a>
+                </div>
+
+                <!-- Menu Desktop -->
+                <div class="hidden lg:flex items-center space-x-6 flex-shrink-0">
+                    <a href="#/"
+                        class="text-gray-700 dark:text-slate-300 hover:text-cenat-green dark:hover:text-green-400 transition">
+                        <i class="fas fa-home mr-1"></i> <span data-i18n="nav.home">Inicio</span>
+                    </a>
+                    <a href="#/my-courses" id="my-courses-link"
+                        class="text-gray-700 dark:text-slate-300 hover:text-cenat-green dark:hover:text-green-400 transition">
+                        <i class="fas fa-book mr-1"></i> <span data-i18n="nav.my_courses">Mis Cursos</span>
+                    </a>
+                    <a href="#/admin" id="admin-link"
+                        class="hidden text-gray-700 dark:text-slate-300 hover:text-cenat-green dark:hover:text-green-400 transition">
+                        <i class="fas fa-cog mr-1"></i> <span data-i18n="nav.admin">Administración</span>
+                    </a>
+                    <a href="#/teacher/courses" id="teacher-link"
+                        class="hidden text-gray-700 dark:text-slate-300 hover:text-cenat-green dark:hover:text-green-400 transition">
+                        <i class="fas fa-chalkboard-teacher mr-1"></i> <span data-i18n="nav.teacher_courses">Mis Cursos (Profesor)</span>
+                    </a>
+
+                    <!-- Acciones de invitado (sin sesión) -->
+                    <div id="guest-actions" class="hidden flex items-center gap-3">
+                        <a href="#/login" class="text-gray-700 dark:text-slate-300 hover:text-cenat-green dark:hover:text-green-400 transition">
+                            <span data-i18n="nav.login">Iniciar sesión</span>
+                        </a>
+                        <a href="#/register" class="btn-cenat px-4 py-2 text-sm">
+                            <span data-i18n="nav.register">Regístrate</span>
+                        </a>
+                    </div>
+
+                    <!-- Idioma -->
+                    <div class="relative" id="language-menu-container">
+                        <button id="language-menu-button" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="language-dropdown"
+                            title="Idioma" data-i18n-title="nav.language" aria-label="Idioma" data-i18n-aria-label="nav.language"
+                            class="flex items-center gap-1 text-sm border border-gray-300 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 rounded px-2 py-0.5 hover:text-cenat-green dark:hover:text-cenat-green transition">
+                            <span class="language-menu-flag" aria-hidden="true"><svg width="18" height="13" viewBox="0 0 20 14" xmlns="http://www.w3.org/2000/svg" class="inline-block rounded-sm shrink-0"><rect width="20" height="14" fill="#AA151B"/><rect y="3.5" width="20" height="7" fill="#F1BF00"/></svg></span>
+                            <span class="language-menu-label">Español</span>
+                            <i class="fas fa-chevron-down text-xs"></i>
+                        </button>
+                        <div id="language-dropdown"
+                            class="hidden absolute left-0 mt-2 w-44 bg-white dark:bg-slate-800 rounded-md shadow-lg py-1 z-50 border border-gray-100 dark:border-slate-700">
+                            <button type="button" class="language-option w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-gray-700 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700" data-locale="es">
+                                <span aria-hidden="true"><svg width="18" height="13" viewBox="0 0 20 14" xmlns="http://www.w3.org/2000/svg" class="inline-block rounded-sm shrink-0"><rect width="20" height="14" fill="#AA151B"/><rect y="3.5" width="20" height="7" fill="#F1BF00"/></svg></span> <span>Español / Spanish</span>
+                            </button>
+                            <button type="button" class="language-option w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-gray-700 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700" data-locale="en">
+                                <span aria-hidden="true"><svg width="18" height="13" viewBox="0 0 20 14" xmlns="http://www.w3.org/2000/svg" class="inline-block rounded-sm shrink-0"><rect width="20" height="14" fill="#B22234"/><rect y="2" width="20" height="2" fill="#fff"/><rect y="6" width="20" height="2" fill="#fff"/><rect y="10" width="20" height="2" fill="#fff"/><rect width="8" height="8" fill="#3C3B6E"/></svg></span> <span>English / Inglés</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Tamaño de letra -->
+                    <div class="flex items-center gap-0.5" title="Tamaño de letra" data-i18n-title="nav.font_size">
+                        <button class="text-size-btn text-size-decrease-btn" onclick="decreaseTextSize()" title="Reducir tamaño de letra" data-i18n-title="nav.decrease_font" aria-label="Reducir tamaño de letra" data-i18n-aria-label="nav.decrease_font">A-</button>
+                        <button class="text-size-btn text-size-increase-btn" onclick="increaseTextSize()" title="Aumentar tamaño de letra" data-i18n-title="nav.increase_font" aria-label="Aumentar tamaño de letra" data-i18n-aria-label="nav.increase_font">A+</button>
+                    </div>
+
+                    <!-- Dark mode toggle -->
+                    <button id="dark-mode-toggle" onclick="toggleDarkMode()" title="Cambiar modo oscuro/claro" data-i18n-title="nav.toggle_dark_mode" aria-label="Cambiar modo oscuro/claro">
+                        <i class="fas fa-moon text-gray-600 dark:text-yellow-400"></i>
+                    </button>
+
+                    <!-- User Menu -->
+                    <div class="relative" id="user-menu-container">
+                        <button id="user-menu-button" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="user-dropdown"
+                            class="flex items-center space-x-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                            <span id="user-nav-avatar"><i class="fas fa-user-circle text-2xl"></i></span>
+                            <span id="user-name" class="max-w-[10rem] truncate">Usuario</span>
+                            <i class="fas fa-chevron-down text-sm"></i>
+                        </button>
+
+                        <!-- Dropdown -->
+                        <div id="user-dropdown"
+                            class="hidden absolute right-0 mt-2 w-48 bg-white dark:bg-slate-800 rounded-md shadow-lg py-1 z-50 border border-gray-100 dark:border-slate-700">
+                            <a href="#/profile"
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700">
+                                <i class="fas fa-user mr-2"></i> <span data-i18n="nav.profile">Mi Perfil</span>
+                            </a>
+                            <button id="logout-btn"
+                                class="w-full text-left block px-4 py-2 text-sm text-gray-700 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700">
+                                <i class="fas fa-sign-out-alt mr-2"></i> <span data-i18n="nav.logout">Cerrar Sesión</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Mobile menu button -->
+                <div class="lg:hidden flex items-center gap-1 sm:gap-3 flex-shrink-0">
+                    <div class="relative" id="language-menu-container-mobile">
+                        <button id="language-menu-button-mobile" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="language-dropdown-mobile"
+                            title="Idioma" data-i18n-title="nav.language" aria-label="Idioma" data-i18n-aria-label="nav.language"
+                            class="flex items-center gap-1 text-sm border border-gray-300 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-200 rounded px-2 py-0.5">
+                            <span class="language-menu-flag" aria-hidden="true"><svg width="18" height="13" viewBox="0 0 20 14" xmlns="http://www.w3.org/2000/svg" class="inline-block rounded-sm shrink-0"><rect width="20" height="14" fill="#AA151B"/><rect y="3.5" width="20" height="7" fill="#F1BF00"/></svg></span>
+                            <span class="language-menu-label">Español</span>
+                            <i class="fas fa-chevron-down text-xs"></i>
+                        </button>
+                        <div id="language-dropdown-mobile"
+                            class="hidden absolute right-0 mt-2 w-44 bg-white dark:bg-slate-800 rounded-md shadow-lg py-1 z-50 border border-gray-100 dark:border-slate-700">
+                            <button type="button" class="language-option w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-gray-700 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700" data-locale="es">
+                                <span aria-hidden="true"><svg width="18" height="13" viewBox="0 0 20 14" xmlns="http://www.w3.org/2000/svg" class="inline-block rounded-sm shrink-0"><rect width="20" height="14" fill="#AA151B"/><rect y="3.5" width="20" height="7" fill="#F1BF00"/></svg></span> <span>Español / Spanish</span>
+                            </button>
+                            <button type="button" class="language-option w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-gray-700 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700" data-locale="en">
+                                <span aria-hidden="true"><svg width="18" height="13" viewBox="0 0 20 14" xmlns="http://www.w3.org/2000/svg" class="inline-block rounded-sm shrink-0"><rect width="20" height="14" fill="#B22234"/><rect y="2" width="20" height="2" fill="#fff"/><rect y="6" width="20" height="2" fill="#fff"/><rect y="10" width="20" height="2" fill="#fff"/><rect width="8" height="8" fill="#3C3B6E"/></svg></span> <span>English / Inglés</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-0.5" title="Tamaño de letra" data-i18n-title="nav.font_size">
+                        <button class="text-size-btn text-size-decrease-btn" onclick="decreaseTextSize()" title="Reducir tamaño de letra" data-i18n-title="nav.decrease_font" aria-label="Reducir tamaño de letra" data-i18n-aria-label="nav.decrease_font">A-</button>
+                        <button class="text-size-btn text-size-increase-btn" onclick="increaseTextSize()" title="Aumentar tamaño de letra" data-i18n-title="nav.increase_font" aria-label="Aumentar tamaño de letra" data-i18n-aria-label="nav.increase_font">A+</button>
+                    </div>
+                    <button id="dark-mode-toggle-mobile" onclick="toggleDarkMode()"
+                        class="text-gray-600 dark:text-yellow-400" title="Cambiar modo oscuro/claro" data-i18n-title="nav.toggle_dark_mode" aria-label="Cambiar modo oscuro/claro">
+                        <i class="fas fa-moon"></i>
+                    </button>
+                    <button id="mobile-menu-btn" type="button" class="text-gray-700 dark:text-slate-300 hover:text-cenat-green"
+                        aria-label="Menú" data-i18n-aria-label="nav.menu" aria-controls="mobile-menu" aria-expanded="false">
+                        <i class="fas fa-bars text-2xl" aria-hidden="true"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Mobile Menu -->
+            <div id="mobile-menu" class="hidden lg:hidden pb-4 dark:bg-slate-800">
+                <a href="#/" class="block py-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                    <i class="fas fa-home mr-1"></i> <span data-i18n="nav.home">Inicio</span>
+                </a>
+                <a href="#/my-courses" id="my-courses-link-mobile"
+                    class="block py-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                    <i class="fas fa-book mr-1"></i> <span data-i18n="nav.my_courses">Mis Cursos</span>
+                </a>
+                <a href="#/admin" id="admin-link-mobile"
+                    class="hidden block py-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                    <i class="fas fa-cog mr-1"></i> <span data-i18n="nav.admin">Administración</span>
+                </a>
+                <a href="#/teacher/courses" id="teacher-link-mobile"
+                    class="hidden block py-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                    <i class="fas fa-chalkboard-teacher mr-1"></i> <span data-i18n="nav.teacher_courses">Mis Cursos (Profesor)</span>
+                </a>
+                <div id="user-menu-container-mobile">
+                    <a href="#/profile"
+                        class="block py-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                        <i class="fas fa-user mr-1"></i> <span data-i18n="nav.profile">Mi Perfil</span>
+                    </a>
+                    <button id="logout-btn-mobile"
+                        class="w-full text-left block py-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                        <i class="fas fa-sign-out-alt mr-1"></i> <span data-i18n="nav.logout">Cerrar Sesión</span>
+                    </button>
+                </div>
+                <div id="guest-actions-mobile" class="hidden">
+                    <a href="#/login" class="block py-2 text-gray-700 dark:text-slate-300 hover:text-cenat-green transition">
+                        <i class="fas fa-sign-in-alt mr-1"></i> <span data-i18n="nav.login">Iniciar sesión</span>
+                    </a>
+                    <a href="#/register" class="block py-2 text-cenat-green font-semibold hover:text-cenat-green-hover transition">
+                        <i class="fas fa-user-plus mr-1"></i> <span data-i18n="nav.register">Regístrate</span>
+                    </a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main id="app" class="min-h-screen">
+        <div class="flex items-center justify-center min-h-screen">
+            <div class="text-center">
+                <i class="fas fa-spinner fa-spin text-4xl text-cenat-green"></i>
+                <p class="mt-4 text-gray-600 dark:text-slate-400" data-i18n="common.loading">Cargando...</p>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer
+        class="bg-white dark:bg-slate-800 border-t border-gray-200 dark:border-slate-700 mt-auto transition-colors duration-300">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+            <div class="text-center text-gray-600 dark:text-slate-400 text-sm">
+                <p data-i18n="footer.copyright">&copy; 2026 LANBA - Centro Nacional de Alta Tecnología (CeNAT)</p>
+                <p class="mt-1" data-i18n="footer.developed_by">Desarrollado por Mauricio Hidalgo Garzón - TCU UFIDE</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Toast Notification -->
+    <!-- role/aria-live los define showToast() según el tipo de aviso (un error
+         se anuncia de inmediato, un éxito espera su turno). -->
+    <div id="toast" class="hidden fixed top-4 right-4 z-50 max-w-sm" role="status" aria-live="polite" aria-atomic="true">
+        <div class="bg-white dark:bg-slate-800 rounded-lg shadow-lg p-4 flex items-center space-x-3">
+            <i id="toast-icon" class="text-2xl" aria-hidden="true"></i>
+            <div class="flex-1">
+                <p id="toast-message" class="text-sm font-medium text-gray-900 dark:text-slate-200"></p>
+            </div>
+            <!-- p-2 -m-2: agranda el área de toque (era 12x24 px) sin mover nada. -->
+            <button type="button" onclick="hideToast()" aria-label="Cerrar" data-i18n-aria-label="common.close"
+                class="p-2 -m-2 rounded text-gray-400 hover:text-gray-600 dark:text-slate-500 dark:hover:text-slate-300">
+                <i class="fas fa-times" aria-hidden="true"></i>
+            </button>
+        </div>
+    </div>
+
+    <!-- Región para anuncios a lectores de pantalla (ver announce() en utils.js). -->
+    <div id="a11y-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- Scripts -->
+    <script src="/js/darkmode.js"></script>
+    <script src="/js/textsize.js"></script>
+    <script src="/js/utils.js"></script>
+    <script src="/js/i18n.js"></script>
+    <script src="/js/api.js"></script>
+    <script src="/js/auth.js"></script>
+    <script src="/js/router.js"></script>
+    <script src="/js/views_auth.js"></script>
+    <script src="/js/views_home.js"></script>
+    <script src="/js/views_course_detail.js"></script>
+    <script src="/js/views_my_courses.js"></script>
+    <script src="/js/views_admin_dashboard.js"></script>
+    <script src="/js/views_admin_courses.js"></script>
+    <script src="/js/views_admin_course_students.js"></script>
+    <script src="/js/views_content_manager.js"></script>
+    <script src="/js/views_quiz.js"></script>
+    <script src="/js/views_admin_create_course.js"></script>
+    <script src="/js/views_admin_edit_course.js"></script>
+    <script src="/js/views_teacher_courses.js"></script>
+    <script src="/js/views_teacher_course.js"></script>
+    <script src="/js/views_task_submissions.js"></script>
+    <script src="/js/views_forum.js"></script>
+    <script src="/js/views_admin_users.js"></script>
+    <script src="/js/views_profile.js"></script>
+    <script src="/js/views_admin_settings.js"></script>
+    <script src="/js/site_settings.js"></script>
+    <script src="/js/app.js"></script>
+
+    <script>
+        initDarkMode();
+        initTextSize();
+    </script>
+</body>
+
+</html>

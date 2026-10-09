@@ -1,0 +1,472 @@
+import pool from '../config/db.js';
+import Course from './Course.js';
+import { t, DEFAULT_LOCALE } from '../utils/i18n.js';
+
+/**
+ * Nombre del profesor escopeado a una carpeta ("módulo"-carpeta, ver
+ * course_teachers.module_id), o NULL si la carpeta no tiene uno. Se usa como
+ * subquery correlacionado en las dos consultas de contenidos por curso.
+ *
+ * El `AND ct.module_id IS NOT NULL` parece redundante (`module_id = co.id`
+ * nunca es verdadero para un NULL) pero NO lo es para el optimizador: sin
+ * él, MySQL descartaba el índice idx_module (casi todas las filas de
+ * course_teachers tienen module_id NULL, así que estima que el índice no
+ * filtra) y recorría course_teachers COMPLETA por cada contenido — medido
+ * con un curso de 1.697 contenidos y 4.119 filas en course_teachers: 1,7 s
+ * por consulta (y bajo carga concurrente frenaba a toda la app) contra
+ * 0,025 s con la condición. No quitarla.
+ */
+const MODULE_TEACHER_NAME_SUBQUERY = `(SELECT u.name FROM course_teachers ct INNER JOIN users u ON u.id = ct.user_id WHERE ct.module_id = co.id AND ct.module_id IS NOT NULL LIMIT 1)`;
+
+class Content {
+  /**
+   * "Redacta" un contenido para un usuario sin acceso (ver
+   * Course.canAccessMedia): siempre oculta la URL, y además el cuerpo de
+   * texto (`description`) si el tipo es 'text' o 'forum' — ahí
+   * `description` ES el contenido real (la lección, o el post principal
+   * del tema), a diferencia de video/file donde es solo una descripción
+   * corta que no hace falta ocultar.
+   */
+  static redactForNoAccess(content) {
+    const hideBody = content.type === 'text' || content.type === 'forum';
+    return {
+      ...content,
+      url: null,
+      description: hideBody ? null : content.description,
+      description_en: hideBody ? null : content.description_en
+    };
+  }
+
+  /**
+   * Obtener contenido por ID
+   */
+  static async findById(id) {
+    const [rows] = await pool.query(
+      `SELECT co.*, c.title as course_title 
+       FROM contents co 
+       INNER JOIN courses c ON co.course_id = c.id 
+       WHERE co.id = ?`,
+      [id]
+    );
+    return rows[0];
+  }
+
+  /**
+   * Obtener contenidos por curso
+   */
+  static async findByCourse(courseId) {
+    const [rows] = await pool.query(
+      `SELECT co.*,
+              (SELECT COUNT(*) FROM content_questions cq WHERE cq.content_id = co.id) AS question_count,
+              ${MODULE_TEACHER_NAME_SUBQUERY} AS module_teacher_name
+       FROM contents co WHERE co.course_id = ? ORDER BY co.order_index ASC`,
+      [courseId]
+    );
+    return rows;
+  }
+
+  /**
+   * Obtener contenidos por curso INCLUYENDO si el usuario los completó.
+   * `ts.*` viene de un LEFT JOIN contra task_submissions DEL PROPIO
+   * usuario — así el detalle de curso puede saber de una sola vez qué
+   * tareas ya entregó (y con qué feedback/estado de revisión) sin tener
+   * que pedir GET /contents/:id/submission una vez por cada tarea del
+   * curso (antes N peticiones en paralelo, ahora ninguna extra).
+   */
+  static async findByCourseWithProgress(courseId, userId) {
+    const [rows] = await pool.query(
+      `SELECT co.*,
+        IF(cp.id IS NOT NULL, TRUE, FALSE) as completed,
+        ts.id as submission_id, ts.submitted_at as submission_submitted_at,
+        ts.feedback as submission_feedback, ts.reviewed_at as submission_reviewed_at,
+        ts.score_earned as submission_score_earned,
+        (SELECT COUNT(*) FROM content_questions cq WHERE cq.content_id = co.id) AS question_count,
+        ${MODULE_TEACHER_NAME_SUBQUERY} AS module_teacher_name
+       FROM contents co
+       LEFT JOIN content_progress cp ON cp.content_id = co.id AND cp.user_id = ?
+       LEFT JOIN task_submissions ts ON ts.content_id = co.id AND ts.user_id = ?
+       WHERE co.course_id = ?
+       ORDER BY co.order_index ASC`,
+      [userId, userId, courseId]
+    );
+    return rows.map((row) => {
+      if (row.type !== 'task') return row;
+      const { submission_id, submission_submitted_at, submission_feedback, submission_reviewed_at, submission_score_earned, ...rest } = row;
+      return {
+        ...rest,
+        my_submission: submission_id
+          ? { submitted_at: submission_submitted_at, feedback: submission_feedback, reviewed_at: submission_reviewed_at, score_earned: submission_score_earned }
+          : null
+      };
+    });
+  }
+
+  /**
+   * Crear un nuevo contenido. `folder_id` (null = "sin carpeta") escopa el
+   * orden: el siguiente order_index se calcula entre los hermanos de esa
+   * misma carpeta (o los del nivel superior), no contra todo el curso —
+   * así cada carpeta empieza su propia numeración desde 1. El operador
+   * `<=>` es NULL-safe: `folder_id <=> NULL` si no hay carpeta, o
+   * `folder_id <=> 5` si la hay, sin necesitar dos queries distintas.
+   */
+  /**
+   * `executor` (pool por defecto) permite pasar una connection ya abierta
+   * dentro de una transacción — usado por quiz.controller.js para que la
+   * creación del content y la de todas sus preguntas/opciones sean una
+   * sola unidad atómica.
+   */
+  static async create({ course_id, type, title, description, title_en, description_en, url, file_size, order_index, folder_id, weight_percent }, executor = pool) {
+    const folderId = folder_id || null;
+
+    if (order_index === undefined) {
+      const [maxOrder] = await executor.query(
+        'SELECT COALESCE(MAX(order_index), 0) + 1 as next_order FROM contents WHERE course_id = ? AND folder_id <=> ?',
+        [course_id, folderId]
+      );
+      order_index = maxOrder[0].next_order;
+    }
+
+    const [result] = await executor.query(
+      `INSERT INTO contents (course_id, type, title, description, title_en, description_en, url, file_size, order_index, folder_id, weight_percent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [course_id, type, title, description || null, title_en || null, description_en || null, url, file_size || null, order_index, folderId, weight_percent ?? null]
+    );
+    return result.insertId;
+  }
+
+  /**
+   * Actualizar contenido. `folder_id` se distingue de "no lo toques"
+   * (undefined) con `!== undefined`, igual que los demás campos — así se
+   * puede mandar `folder_id: null` explícito para sacar algo de su carpeta.
+   * `executor` (pool por defecto) permite pasar una connection ya abierta
+   * dentro de una transacción — usado por quiz.controller.js al reemplazar
+   * las preguntas de un quiz/survey.
+   */
+  static async update(id, { title, description, title_en, description_en, url, order_index, folder_id, weight_percent }, executor = pool) {
+    const fields = [];
+    const values = [];
+
+    if (title !== undefined) {
+      fields.push('title = ?');
+      values.push(title);
+    }
+    if (description !== undefined) {
+      fields.push('description = ?');
+      values.push(description);
+    }
+    if (title_en !== undefined) {
+      fields.push('title_en = ?');
+      values.push(title_en);
+    }
+    if (description_en !== undefined) {
+      fields.push('description_en = ?');
+      values.push(description_en);
+    }
+    if (url !== undefined) {
+      fields.push('url = ?');
+      values.push(url);
+    }
+    if (order_index !== undefined) {
+      fields.push('order_index = ?');
+      values.push(order_index);
+    }
+    if (folder_id !== undefined) {
+      fields.push('folder_id = ?');
+      values.push(folder_id);
+    }
+    if (weight_percent !== undefined) {
+      fields.push('weight_percent = ?');
+      values.push(weight_percent);
+    }
+
+    if (fields.length === 0) return false;
+
+    values.push(id);
+    const [result] = await executor.query(
+      `UPDATE contents SET ${fields.join(', ')} WHERE id = ?`,
+      values
+    );
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * true si una carpeta todavía tiene contenido adentro (folder_id
+   * apuntando a ella) — se usa para bloquear su borrado hasta que esté
+   * vacía, en vez de borrar todo en cascada.
+   */
+  static async hasChildren(folderId) {
+    const [rows] = await pool.query(
+      'SELECT id FROM contents WHERE folder_id = ? LIMIT 1',
+      [folderId]
+    );
+    return rows.length > 0;
+  }
+
+  /**
+   * Eliminar contenido
+   */
+  static async delete(id) {
+    const [result] = await pool.query('DELETE FROM contents WHERE id = ?', [id]);
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * Reordenar contenidos de un curso.
+   * Antes hacía un UPDATE por elemento dentro de una transacción (N
+   * queries para N contenidos); ahora es un único UPDATE con CASE WHEN,
+   * que además es atómico de por sí (no requiere transacción manual).
+   * El WHERE con course_id sigue evitando que se cuele el id de un
+   * contenido de otro curso.
+   */
+  static async reorder(courseId, contentIds) {
+    if (contentIds.length === 0) return true;
+
+    const caseClauses = contentIds.map(() => 'WHEN ? THEN ?').join(' ');
+    const caseParams = contentIds.flatMap((id, i) => [id, i + 1]);
+    const placeholders = contentIds.map(() => '?').join(', ');
+
+    const [result] = await pool.query(
+      `UPDATE contents SET order_index = CASE id ${caseClauses} ELSE order_index END
+       WHERE course_id = ? AND id IN (${placeholders})`,
+      [...caseParams, courseId, ...contentIds]
+    );
+
+    return result.affectedRows > 0;
+  }
+
+  // =================================
+  // Progreso por contenido
+  // =================================
+
+  /**
+   * Marcar un contenido como completado por un usuario
+   */
+  static async markCompleted(contentId, userId) {
+    try {
+      const [result] = await pool.query(
+        'INSERT INTO content_progress (user_id, content_id) VALUES (?, ?)',
+        [userId, contentId]
+      );
+      return result.insertId;
+    } catch (error) {
+      // Ya estaba marcado como completado (UNIQUE constraint) - no es un error real
+      if (error.code === 'ER_DUP_ENTRY') {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Desmarcar un contenido como completado (volver a "pendiente")
+   */
+  static async markIncomplete(contentId, userId) {
+    const [result] = await pool.query(
+      'DELETE FROM content_progress WHERE content_id = ? AND user_id = ?',
+      [contentId, userId]
+    );
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * Cuenta total/completados de un usuario sobre un CONJUNTO de course_id ya
+   * resuelto — extraído para que recalculateCourseProgress (persiste),
+   * calculateGroupProgress (combinado, solo lectura) y
+   * calculateProgressForSingleCourse (un curso puntual, solo lectura)
+   * compartan la misma query en vez de triplicarla. Una carpeta queda fuera
+   * (es solo un agrupador, no contenido en sí), una imagen también (es
+   * solo decoración/ilustración, no algo que tenga sentido "completar"), y
+   * un texto también (es material de lectura opcional, no una actividad
+   * que el profesor quiera exigir para avanzar) — contarlas dejaría a los
+   * estudiantes sin poder llegar nunca al 100% ni sacar certificado. Un
+   * foro SÍ cuenta (participar con al menos un post lo marca completado,
+   * ver forum.controller.js createPost).
+   */
+  static async _computeProgress(courseIds, userId) {
+    const [totalRows] = await pool.query(
+      "SELECT COUNT(*) as total FROM contents WHERE course_id IN (?) AND type NOT IN ('folder', 'image', 'text')",
+      [courseIds]
+    );
+    const total = totalRows[0].total;
+
+    const [completedRows] = await pool.query(
+      `SELECT COUNT(*) as completed
+       FROM content_progress cp
+       INNER JOIN contents co ON co.id = cp.content_id
+       WHERE co.course_id IN (?) AND cp.user_id = ? AND co.type NOT IN ('folder', 'image', 'text')`,
+      [courseIds, userId]
+    );
+    const completed = completedRows[0].completed;
+
+    const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
+    return { progress, total, completed };
+  }
+
+  /**
+   * Calcular y actualizar el porcentaje de progreso de un usuario en un
+   * curso. Resuelve la raíz (si `courseId` es un curso hijo de un módulo,
+   * la inscripción/progreso real vive en el padre — ver
+   * Course.resolveEnrollmentRoot) y junta TODOS los course_id que cuentan
+   * para ese progreso combinado: el padre más todos sus cursos hijo. Los 5
+   * call-sites de este método (content/submission/quiz/forum controllers)
+   * siguen pasando el course_id crudo del contenido recién tocado, sin
+   * cambios — este es el único choke point que necesita saber de módulos.
+   */
+  static async recalculateCourseProgress(courseId, userId) {
+    const rootId = await Course.resolveEnrollmentRoot(courseId);
+    const courseIds = await Course.getProgressGroupIds(rootId);
+    const result = await Content._computeProgress(courseIds, userId);
+
+    // Actualizar el progreso en la tabla enrollments — SIEMPRE en la fila
+    // del curso raíz, nunca en la de un curso hijo (que no tiene una).
+    // completed_at se marca solo la primera vez que se llega a 100 (CASE
+    // con "completed_at IS NULL") y no se vuelve a tocar después, aunque el
+    // progreso baje más adelante por desmarcar contenido: sirve como fecha
+    // de finalización para el certificado, no como "está completo ahora
+    // mismo".
+    await pool.query(
+      `UPDATE enrollments
+       SET progress = ?,
+           completed_at = CASE WHEN ? = 100 AND completed_at IS NULL THEN NOW() ELSE completed_at END
+       WHERE course_id = ? AND user_id = ?`,
+      [result.progress, result.progress, rootId, userId]
+    );
+
+    // `enrollment_course_id` (el curso raíz, no necesariamente el
+    // `courseId` recibido) se expone para que un caller que NO esté en la
+    // página de detalle del curso (quiz, encuesta, foro — ver
+    // quiz.controller.js/forum.controller.js) pueda mostrar la celebración
+    // de curso completado con el id correcto para el certificado, sin
+    // tener que resolver el padre por su cuenta.
+    return { ...result, enrollment_course_id: rootId };
+  }
+
+  /**
+   * Igual que recalculateCourseProgress (resuelve la raíz y combina padre +
+   * cursos hijo) pero SIN persistir — para que el frontend muestre la barra
+   * de progreso/gating del certificado usando el mismo total combinado que
+   * el servidor, en vez de recalcularlo solo con los `contents` de la
+   * página actual (ver course.controller.js#getCourseById). Acepta un
+   * `rootId` ya resuelto por el caller (evita repetir esa consulta cuando
+   * el caller también llama a Course.getEnrollment con el mismo curso).
+   */
+  static async calculateGroupProgress(courseId, userId, rootId = null) {
+    const resolvedRootId = rootId ?? await Course.resolveEnrollmentRoot(courseId);
+    const courseIds = await Course.getProgressGroupIds(resolvedRootId);
+    return Content._computeProgress(courseIds, userId);
+  }
+
+  /**
+   * Progreso de un usuario dentro de UN curso puntual, sin resolver la raíz
+   * ni persistir — para que un profesor de módulo vea en "Ver estudiantes"
+   * el avance específico de SU curso hijo en vez del combinado del padre
+   * completo (ver course.controller.js#getCourseStudents).
+   */
+  static async calculateProgressForSingleCourse(courseId, userId) {
+    return Content._computeProgress([courseId], userId);
+  }
+
+  /**
+   * Detalle de la nota de un estudiante en un curso: un item por cada
+   * tarea calificada CON weight_percent, y por cada cuestionario CON
+   * weight_percent que el estudiante ya respondió POR COMPLETO —
+   * "por completo" significa que ninguna pregunta de respuesta corta sigue
+   * con is_correct NULL (pendiente de que el profesor la revise a mano).
+   * Una tarea/cuestionario SIN weight_percent asignado no genera item (el
+   * profesor decidió que no cuenta para la nota). `total` es la suma de
+   * todos los items, o null si todavía no hay ninguno (para que la UI
+   * muestre "—" en vez de "0"). Usado tanto para calcular la nota final
+   * (calculateCourseGrade) como para el CSV de detalle por estudiante (ver
+   * course.controller.js exportStudentGrades).
+   */
+  /**
+   * Cuestionarios calificables (con weight_percent) de un curso — no
+   * depende del estudiante, así que un caller que calcula la nota de VARIOS
+   * estudiantes del mismo curso (getCourseStudents/exportCourseGrades) la
+   * pide una sola vez y se la pasa a getCourseGradeBreakdown/
+   * calculateCourseGrade en vez de dejar que cada llamada (una POR
+   * estudiante) la repita idéntica.
+   */
+  static async getGradableQuizzes(courseId) {
+    const [rows] = await pool.query(
+      `SELECT id, title, weight_percent FROM contents WHERE course_id = ? AND type = 'quiz' AND weight_percent IS NOT NULL`,
+      [courseId]
+    );
+    return rows;
+  }
+
+  static async getCourseGradeBreakdown(courseId, userId, quizRows = null, locale = DEFAULT_LOCALE) {
+    const [taskRows] = await pool.query(
+      `SELECT c.title, c.weight_percent, ts.score_earned
+       FROM task_submissions ts
+       INNER JOIN contents c ON c.id = ts.content_id
+       WHERE c.course_id = ? AND ts.user_id = ? AND c.type = 'task'
+         AND c.weight_percent IS NOT NULL AND ts.score_earned IS NOT NULL`,
+      [courseId, userId]
+    );
+
+    const items = taskRows.map((row) => ({
+      title: row.title,
+      type: t(locale, 'labels.content_type_task'),
+      weight_percent: Number(row.weight_percent),
+      earned: Number(row.score_earned)
+    }));
+
+    if (quizRows === null) {
+      quizRows = await Content.getGradableQuizzes(courseId);
+    }
+
+    // Una sola query para las respuestas de TODOS los cuestionarios del
+    // curso (agrupadas en memoria por content_id), en vez de una query por
+    // cuestionario dentro del for — este método se llama una vez POR
+    // ESTUDIANTE (ver calculateCourseGrade/exportCourseGrades), así que el
+    // costo del for suelto se multiplicaba por (estudiantes × cuestionarios).
+    const answersByQuizId = new Map();
+    if (quizRows.length > 0) {
+      const [allAnswerRows] = await pool.query(
+        `SELECT ca.content_id, ca.is_correct, cq.points
+         FROM content_answers ca
+         INNER JOIN content_questions cq ON cq.id = ca.question_id
+         WHERE ca.content_id IN (?) AND ca.user_id = ?`,
+        [quizRows.map((q) => q.id), userId]
+      );
+      for (const row of allAnswerRows) {
+        if (!answersByQuizId.has(row.content_id)) answersByQuizId.set(row.content_id, []);
+        answersByQuizId.get(row.content_id).push(row);
+      }
+    }
+
+    for (const quiz of quizRows) {
+      const answerRows = answersByQuizId.get(quiz.id) || [];
+
+      if (answerRows.length === 0) continue;
+      if (answerRows.some((a) => a.is_correct === null)) continue;
+
+      const maxPoints = answerRows.reduce((sum, a) => sum + a.points, 0);
+      if (maxPoints === 0) continue;
+      const earnedPoints = answerRows.filter((a) => a.is_correct == 1).reduce((sum, a) => sum + a.points, 0);
+
+      items.push({
+        title: quiz.title,
+        type: t(locale, 'labels.content_type_quiz'),
+        weight_percent: Number(quiz.weight_percent),
+        earned: Math.round((earnedPoints / maxPoints) * Number(quiz.weight_percent) * 100) / 100
+      });
+    }
+
+    const total = items.length > 0 ? Math.round(items.reduce((sum, item) => sum + item.earned, 0) * 100) / 100 : null;
+    return { items, total };
+  }
+
+  /**
+   * Nota final de un estudiante en un curso — ver getCourseGradeBreakdown
+   * para el detalle de cómo se calcula cada item. `quizRows` opcional, ver
+   * getGradableQuizzes.
+   */
+  static async calculateCourseGrade(courseId, userId, quizRows = null) {
+    const { total } = await Content.getCourseGradeBreakdown(courseId, userId, quizRows);
+    return total;
+  }
+}
+
+export default Content;

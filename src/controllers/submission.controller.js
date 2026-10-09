@@ -1,0 +1,210 @@
+import Content from '../models/Content.js';
+import Course from '../models/Course.js';
+import TaskSubmission from '../models/TaskSubmission.js';
+import { deleteFile } from '../middlewares/upload.middleware.js';
+import { UPLOADS_ROOT } from '../config/uploads.js';
+import { t } from '../utils/i18n.js';
+import { parsePagination, buildPagination } from '../utils/pagination.js';
+import { hasAdminAccess } from '../utils/permissions.js';
+import fs from 'fs';
+import path from 'path';
+
+/**
+ * Entregar una tarea. La ruta ya validó (antes de multer, para no escribir
+ * el archivo si algo de esto falla) que la tarea existe, que es type='task'
+ * y que el usuario está inscrito en el curso — ver content.routes.js,
+ * que deja el contenido ya cargado en req.taskContent.
+ *
+ * Una sola entrega por tarea/estudiante: si ya existía una,
+ * TaskSubmission.create devuelve null (constraint UNIQUE) y se rechaza
+ * sin reemplazar nada. Al entregar con éxito, la tarea se marca
+ * completada automáticamente (mismo mecanismo que markContentCompleted)
+ * para que cuente en el progreso del curso.
+ */
+export const submitTask = async (req, res) => {
+  try {
+    const content = req.taskContent;
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.submission_file_required') });
+    }
+
+    const fileUrl = `/uploads/submissions/${req.file.filename}`;
+    const submissionId = await TaskSubmission.create(content.id, req.session.user.id, fileUrl);
+
+    if (submissionId === null) {
+      await deleteFile(fileUrl);
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.already_submitted_task')
+      });
+    }
+
+    await Content.markCompleted(content.id, req.session.user.id);
+    const progress = await Content.recalculateCourseProgress(content.course_id, req.session.user.id);
+
+    res.status(201).json({
+      success: true,
+      message: t(req.locale, 'success.task_submitted'),
+      data: { id: submissionId, ...progress }
+    });
+  } catch (error) {
+    console.error('Error al entregar la tarea:', error);
+    if (req.file) {
+      await deleteFile(`/uploads/submissions/${req.file.filename}`);
+    }
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.submit_task_failed') });
+  }
+};
+
+/**
+ * La propia entrega del usuario autenticado para una tarea (o null si
+ * todavía no entregó). Cada quien solo puede ver la suya — no recibe un
+ * user_id por parámetro a propósito.
+ */
+export const getMySubmission = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const submission = await TaskSubmission.findByContentAndUser(id, req.session.user.id);
+    res.json({ success: true, data: submission || null });
+  } catch (error) {
+    console.error('Error al obtener la entrega:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_submission_failed') });
+  }
+};
+
+/**
+ * Todas las entregas de una tarea (vista de admin/profesor para revisar).
+ * Autorización resuelta en la ruta con requireCourseManager.
+ */
+export const listSubmissions = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const content = await Content.findById(id);
+    if (!content) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.task_not_found') });
+    }
+
+    const { page, limit } = parsePagination(req.query, 20);
+    const { rows: submissions, total } = await TaskSubmission.findPaginatedByContent(id, { page, limit });
+
+    res.json({
+      success: true,
+      data: { content, submissions },
+      pagination: buildPagination(page, limit, total)
+    });
+  } catch (error) {
+    console.error('Error al obtener las entregas:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_submissions_failed') });
+  }
+};
+
+/**
+ * Descargar el archivo de una entrega. A diferencia de downloadFile
+ * (contenido de curso), aquí NO alcanza con "estar inscrito en el curso"
+ * — cualquier estudiante inscrito podría entonces ver las entregas de
+ * los demás. Solo puede descargar: admin, el profesor asignado al curso
+ * de esa tarea, o el propio estudiante dueño de la entrega.
+ */
+export const downloadSubmission = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const submission = await TaskSubmission.findById(id);
+    if (!submission) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.submission_not_found') });
+    }
+
+    const content = await Content.findById(submission.content_id);
+    const isOwner = submission.user_id === req.session.user.id;
+    const isAdminUser = hasAdminAccess(req.session.user);
+    // canManageContent (no isUserTeacher): un profesor escopeado a un
+    // módulo (course_teachers.module_id) solo puede descargar entregas de
+    // SU módulo, igual que ya puede verlas/calificarlas (ver
+    // submission.routes.js) — isUserTeacher solo miraba "¿tiene alguna
+    // fila en course_teachers de este curso?", sin importar el módulo, así
+    // que dejaba descargar entregas de tareas fuera de su alcance.
+    const isTeacherOfCourse = content && req.session.user.role === 'teacher'
+      && await Course.canManageContent(content.course_id, req.session.user.id, content.folder_id);
+
+    if (!isOwner && !isAdminUser && !isTeacherOfCourse) {
+      return res.status(403).json({
+        success: false,
+        message: t(req.locale, 'errors.download_submission_permission')
+      });
+    }
+
+    const filePath = path.join(UPLOADS_ROOT, submission.file_url.replace(/^\/?uploads\//, ''));
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.file_not_found_server') });
+    }
+
+    res.download(filePath, path.basename(submission.file_url));
+  } catch (error) {
+    console.error('Error al descargar la entrega:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.download_submission_failed') });
+  }
+};
+
+/**
+ * Marcar una entrega como revisada, con comentario y calificación
+ * opcionales. Autorización resuelta en la ruta con requireCourseManager.
+ *
+ * `score_earned` se guarda en las mismas unidades que el `weight_percent`
+ * de la tarea (ver Content) — no es una nota "de 0 a 10" aparte: si la
+ * tarea vale 10% del curso, calificarla "7" significa que el estudiante
+ * ganó 7 de esos 10 puntos porcentuales. Por eso solo tiene sentido
+ * calificar así una tarea que YA tiene un porcentaje asignado.
+ */
+export const reviewSubmission = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { feedback, score_earned } = req.body;
+
+    const submission = await TaskSubmission.findById(id);
+    if (!submission) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.submission_not_found') });
+    }
+
+    // Un campo AUSENTE del body conserva el valor ya guardado — no se pisa
+    // con null. Sin esto, llamar este endpoint dos veces (una con
+    // feedback, otra solo con la nota) borraba en silencio el valor que no
+    // se reenvió la segunda vez. El formulario actual siempre manda ambos
+    // campos juntos, así que esto es sobre todo defensivo (por si se llama
+    // la API desde otro lado en el futuro), no un bug activo hoy.
+    const feedbackToSave = feedback !== undefined ? feedback : (submission.feedback ?? null);
+    let scoreToSave = submission.score_earned ?? null;
+    if (score_earned !== undefined) {
+      if (score_earned === null || score_earned === '') {
+        scoreToSave = null;
+      } else {
+        const content = await Content.findById(submission.content_id);
+        // === null (no !content.weight_percent): una tarea con 0% de peso
+        // es un valor explícitamente válido, no "sin peso asignado".
+        if (content.weight_percent === null) {
+          return res.status(400).json({
+            success: false,
+            message: t(req.locale, 'errors.task_no_weight_percent')
+          });
+        }
+        const score = Number(score_earned);
+        if (!Number.isFinite(score) || score < 0 || score > Number(content.weight_percent)) {
+          return res.status(400).json({
+            success: false,
+            message: t(req.locale, 'errors.score_out_of_range', { max: content.weight_percent })
+          });
+        }
+        scoreToSave = score;
+      }
+    }
+
+    await TaskSubmission.markReviewed(id, feedbackToSave, scoreToSave);
+
+    res.json({ success: true, message: t(req.locale, 'success.submission_reviewed') });
+  } catch (error) {
+    console.error('Error al revisar la entrega:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.review_submission_failed') });
+  }
+};

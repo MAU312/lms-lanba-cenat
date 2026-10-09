@@ -1,0 +1,419 @@
+/**
+ * Views - Responder un cuestionario/encuesta (estudiante) y ver sus
+ * resultados (profesor/admin). Cuestionario y encuesta comparten estas dos
+ * pantallas — la única diferencia es si se muestra puntaje/calificación
+ * (cuestionario) o solo conteos agregados (encuesta, sin respuesta
+ * correcta).
+ */
+
+let currentQuizContentId = null;
+
+// Vista de resultados: /results manda solo las primeras respuestas de cada
+// pregunta de respuesta corta (ver RESULTS_INLINE_SHORT_ANSWERS en
+// quiz.controller.js); "Mostrar más" pide las siguientes de a
+// SHORT_ANSWERS_PAGE_SIZE. `resultAnswersById` guarda los datos de cada fila
+// dibujada para poder actualizar UNA fila al calificarla sin repintar toda la
+// página (repintar perdía lo que el profesor ya había expandido).
+const SHORT_ANSWERS_PAGE_SIZE = 20;
+const resultAnswersById = new Map();
+let currentResultsIsQuiz = true;
+
+window.renderTakeQuiz = async function(params) {
+    const app = document.getElementById('app');
+    showLoading();
+    // Mismo guard que views_course_detail.js: si se navega rápido a otro
+    // quiz/página antes de que termine este fetch, no debe pisar la vista
+    // a la que el usuario ya navegó.
+    const myNavToken = getNavToken();
+
+    try {
+        const [contentResponse, questionsResponse] = await Promise.all([
+            contentsAPI.getById(params.id),
+            contentsAPI.getQuestions(params.id)
+        ]);
+        if (myNavToken !== getNavToken()) return;
+
+        const content = contentResponse.data;
+        const { already_answered, questions } = questionsResponse.data;
+        const isQuiz = content.type === 'quiz';
+
+        // Un solo intento: si ya respondió, no tiene sentido mostrar el
+        // formulario de nuevo — de vuelta al curso, donde ya se ve su
+        // estado/puntaje (ver renderQuizCard en views_course_detail.js).
+        if (already_answered) {
+            navigateTo(`/course/${content.course_id}`);
+            return;
+        }
+
+        app.innerHTML = `
+            <div class="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                <a href="#/course/${content.course_id}" class="text-cenat-green hover:underline text-sm mb-4 inline-block">
+                    <i class="fas fa-arrow-left mr-1"></i> ${t('quiz.back_to_course')}
+                </a>
+
+                <h1 class="text-2xl font-bold text-gray-900 mb-1">
+                    <i class="fas ${isQuiz ? 'fa-question-circle' : 'fa-poll'} text-cenat-green mr-2"></i> ${escapeHtml(localizedText(content, 'title'))}
+                </h1>
+                ${content.description ? `<p class="text-gray-500 mb-6 whitespace-pre-line">${escapeHtml(localizedText(content, 'description'))}</p>` : '<div class="mb-6"></div>'}
+
+                <form id="quiz-take-form" class="space-y-4">
+                    ${questions.map((q, index) => renderQuestionField(q, index, isQuiz)).join('')}
+                    <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
+                        <button type="submit" class="submit-quiz-answers-btn btn-cenat w-full">
+                            <i class="fas fa-paper-plane mr-2"></i> ${isQuiz ? t('quiz.submit_quiz') : t('quiz.submit_survey')}
+                        </button>
+                        <p class="text-xs text-gray-400 text-center mt-2">${t('quiz.submit_once_notice')}</p>
+                    </div>
+                </form>
+            </div>
+        `;
+
+        document.getElementById('quiz-take-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            submitQuizAnswers(content, questions);
+        });
+        initYoutubeEmbeds();
+
+    } catch (error) {
+        console.error('Error loading quiz:', error);
+        app.innerHTML = `
+            <div class="min-h-screen flex items-center justify-center">
+                <div class="text-center">
+                    <i class="fas fa-exclamation-triangle text-5xl text-red-500 mb-4"></i>
+                    <p class="text-xl text-gray-600">${escapeHtml(error.message || t('quiz.load_failed'))}</p>
+                    <a href="#/" class="btn-cenat mt-4 inline-block">${t('quiz.back_to_home')}</a>
+                </div>
+            </div>
+        `;
+    }
+};
+
+// Imagen/video/URL opcional de una pregunta (ver resolveQuestionAttachments
+// en quiz.controller.js) — compartida entre la vista de responder y las 3
+// ramas de renderResultQuestion más abajo, mismo bloque para las tres.
+// `domId` identifica el embed de YouTube de ESTA pregunta en el DOM (tiene
+// que ser único en toda la página, ver initYoutubeEmbeds en utils.js) — el
+// caller arma uno distinto por contexto (responder vs resultados) para que
+// no choquen si ambas vistas llegaran a convivir alguna vez.
+function renderQuestionAttachmentHTML(q, domId) {
+    if (!q.attachment_type || !q.attachment_url) return '';
+    if (q.attachment_type === 'image') {
+        return `<img src="${escapeAttr(q.attachment_url)}" alt="${escapeAttr(t('quiz.attachment_image_alt'))}" class="max-w-full rounded-lg border border-gray-200 mb-3">`;
+    }
+    if (q.attachment_type === 'video') {
+        return `
+            <video controls class="w-full rounded-lg border border-gray-200 mb-3">
+                <source src="${escapeAttr(q.attachment_url)}">
+            </video>
+        `;
+    }
+    // 'url': YouTube/Vimeo se embeben directo, mismo mecanismo que
+    // renderUrlContentRow en views_course_detail.js (API oficial de
+    // YouTube para detectar si el dueño bloqueó la incrustación y mostrar
+    // un aviso propio en vez del cartel de error de YouTube). Cualquier
+    // otro link se deja como antes, solo un link externo.
+    const youtubeId = getYoutubeVideoId(q.attachment_url);
+    const vimeoUrl = !youtubeId ? getVimeoEmbedUrl(q.attachment_url) : null;
+    if (youtubeId) {
+        return `
+            <div data-embed-wrapper class="mb-3">
+                <div class="video-player-container">
+                    <div id="${domId}" data-yt-embed="${youtubeId}"></div>
+                </div>
+                <div data-embed-fallback class="hidden text-sm text-gray-500 bg-gray-50 rounded-lg p-3 mt-2">
+                    <i class="fas fa-triangle-exclamation text-yellow-500 mr-1"></i>
+                    ${t('courseDetail.video_cannot_embed')}
+                </div>
+            </div>
+        `;
+    }
+    if (vimeoUrl) {
+        return `
+            <div class="video-player-container mb-3">
+                <iframe src="${vimeoUrl}" title="" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+            </div>
+        `;
+    }
+    return `<a href="${escapeAttr(q.attachment_url)}" target="_blank" rel="noopener" class="inline-flex items-center gap-1 text-sm text-cenat-green hover:underline mb-3"><i class="fas fa-link" aria-hidden="true"></i> ${escapeHtml(q.attachment_url)}</a>`;
+}
+
+function renderQuestionField(question, index, isQuiz) {
+    return `
+        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-4" role="group" aria-labelledby="question-label-${question.id}">
+            <p id="question-label-${question.id}" class="font-medium text-gray-900 mb-3">${index + 1}. ${escapeHtml(localizedText(question, 'question_text'))} ${isQuiz ? `<span class="text-xs font-normal text-gray-400">(${t(question.points === 1 ? 'quiz.point_singular' : 'quiz.point_plural', { count: question.points })})</span>` : ''}</p>
+            ${renderQuestionAttachmentHTML(question, `yt-embed-take-${question.id}`)}
+            ${question.question_type === 'short_answer' ? `
+                <textarea class="answer-input w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" data-question-id="${question.id}" rows="3" required aria-labelledby="question-label-${question.id}" placeholder="${escapeAttr(t('quiz.answer_placeholder'))}"></textarea>
+            ` : `
+                <!-- role="radiogroup" + aria-labelledby: sin esto un lector de
+                     pantalla leía las opciones SIN decir de qué pregunta son
+                     (la pregunta era un <p> suelto, no asociado a los radios). -->
+                <div class="space-y-2" role="radiogroup" aria-labelledby="question-label-${question.id}">
+                    ${question.options.map(opt => `
+                        <label class="flex items-center gap-2 p-2 border border-gray-200 rounded-lg hover:bg-gray-50 has-[:checked]:bg-green-50 has-[:checked]:border-cenat-green cursor-pointer">
+                            <input type="radio" name="question-${question.id}" class="answer-input" value="${opt.id}" required>
+                            <span class="text-sm text-gray-700">${escapeHtml(localizedText(opt, 'option_text'))}</span>
+                        </label>
+                    `).join('')}
+                </div>
+            `}
+        </div>
+    `;
+}
+
+async function submitQuizAnswers(content, questions) {
+    const submitBtn = document.querySelector('.submit-quiz-answers-btn');
+
+    const answers = questions.map((q) => {
+        if (q.question_type === 'short_answer') {
+            const textarea = document.querySelector(`textarea[data-question-id="${q.id}"]`);
+            return { question_id: q.id, answer_text: textarea.value.trim() };
+        }
+        const checked = document.querySelector(`input[name="question-${q.id}"]:checked`);
+        return { question_id: q.id, option_id: checked ? Number(checked.value) : null };
+    });
+
+    const answersByQuestionId = new Map(questions.map((q) => [q.id, q]));
+    const missingAnswer = answers.some((a) => (answersByQuestionId.get(a.question_id).question_type === 'short_answer' ? !a.answer_text : !a.option_id));
+    if (missingAnswer) {
+        showToast(t('quiz.all_questions_required'), 'error');
+        return;
+    }
+
+    const isQuiz = content.type === 'quiz';
+
+    try {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<i class="fas fa-spinner fa-spin mr-2"></i> ${t('quiz.sending')}`;
+
+        const response = await contentsAPI.submitAnswers(content.id, { answers });
+
+        if (isQuiz) {
+            const { score, max_score, pending_review } = response.data;
+            const pendingNote = pending_review > 0 ? t(pending_review === 1 ? 'quiz.pending_review_singular' : 'quiz.pending_review_plural', { count: pending_review }) : '';
+            showToast(`${t('quiz.submitted_score', { score, max: max_score })}${pendingNote}`, 'success');
+        } else {
+            showToast(t('quiz.survey_thanks'), 'success');
+        }
+
+        navigateTo(`/course/${content.course_id}`);
+
+        // Igual que al tildar un checkbox o entregar una tarea en la propia
+        // página del curso (ver toggleContentCompleted/setupTaskSubmitForms
+        // en views_course_detail.js): si responder esto era lo último que
+        // faltaba para el 100%, debe salir la misma celebración. El modal
+        // se agrega directo a document.body (no a #app), así que mostrarlo
+        // acá funciona aunque la navegación de arriba todavía no haya
+        // terminado de renderizar la página del curso.
+        if (response.data.progress === 100) {
+            showCourseCompletionModal(response.data.enrollment_course_id);
+        }
+    } catch (error) {
+        showToast(error.message || t('quiz.submit_failed'), 'error');
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = `<i class="fas fa-paper-plane mr-2"></i> ${isQuiz ? t('quiz.submit_quiz') : t('quiz.submit_survey')}`;
+    }
+}
+
+window.renderQuizResults = async function(params) {
+    const app = document.getElementById('app');
+    showLoading();
+    currentQuizContentId = params.id;
+    const myNavToken = getNavToken();
+
+    try {
+        const [contentResponse, resultsResponse] = await Promise.all([
+            contentsAPI.getById(params.id),
+            contentsAPI.getResults(params.id)
+        ]);
+        if (myNavToken !== getNavToken()) return;
+
+        const content = contentResponse.data;
+        const { type, total_respondents, questions } = resultsResponse.data;
+        const isQuiz = type === 'quiz';
+        currentResultsIsQuiz = isQuiz;
+        resultAnswersById.clear();
+
+        app.innerHTML = `
+            <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                <a href="javascript:history.back()" class="text-cenat-green hover:underline text-sm mb-4 inline-block">
+                    <i class="fas fa-arrow-left mr-1"></i> ${t('quiz.results_back')}
+                </a>
+
+                <h1 class="text-2xl font-bold text-gray-900 mb-1">
+                    <i class="fas fa-chart-bar text-cenat-green mr-2"></i> ${t('quiz.results_title')}
+                </h1>
+                <p class="text-gray-500 mb-6">${escapeHtml(localizedText(content, 'title'))} — ${t(total_respondents === 1 ? 'quiz.respondents_singular' : 'quiz.respondents_plural', { count: total_respondents })}</p>
+
+                ${questions.length > 0 ? `
+                    <div class="space-y-4">
+                        ${questions.map((q, index) => renderResultQuestion(q, index, isQuiz)).join('')}
+                    </div>
+                ` : renderEmptyStateHTML({
+                    wrapperClass: 'empty-state bg-white rounded-xl border border-gray-100',
+                    icon: 'fa-inbox',
+                    titleClass: 'text-xl text-gray-600 font-medium',
+                    title: isQuiz ? t('quiz.no_questions_quiz') : t('quiz.no_questions_survey')
+                })}
+            </div>
+        `;
+        initYoutubeEmbeds();
+
+    } catch (error) {
+        console.error('Error loading results:', error);
+        app.innerHTML = `
+            <div class="min-h-screen flex items-center justify-center">
+                <div class="text-center">
+                    <i class="fas fa-exclamation-triangle text-5xl text-red-500 mb-4"></i>
+                    <p class="text-xl text-gray-600">${escapeHtml(error.message || t('quiz.results_load_failed'))}</p>
+                </div>
+            </div>
+        `;
+    }
+};
+
+function renderResultQuestion(q, index, isQuiz) {
+    if (q.question_type === 'short_answer') {
+        return `
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
+                <p class="font-medium text-gray-900 mb-3">${index + 1}. ${escapeHtml(q.question_text)} ${isQuiz ? `<span class="text-xs font-normal text-gray-400">(${t(q.points === 1 ? 'quiz.point_singular' : 'quiz.point_plural', { count: q.points })})</span>` : ''}</p>
+                ${renderQuestionAttachmentHTML(q, `yt-embed-result-${q.question_id}`)}
+                ${q.answers.length > 0 ? `
+                    <div id="short-answers-${q.question_id}" class="space-y-2" data-loaded="${q.answers.length}" data-total="${q.answers_total}">
+                        ${q.answers.map((a) => { resultAnswersById.set(a.answer_id, a); return renderShortAnswerRow(a, isQuiz); }).join('')}
+                    </div>
+                    ${q.answers_total > q.answers.length ? `
+                        <button onclick="showMoreShortAnswers(${q.question_id}, this)" class="mt-3 text-sm text-cenat-green hover:underline font-medium">
+                            <i class="fas fa-chevron-down mr-1"></i> ${t('quiz.show_more_answers', { remaining: q.answers_total - q.answers.length })}
+                        </button>
+                    ` : ''}
+                ` : `<p class="text-sm text-gray-400">${t('quiz.no_answers_yet')}</p>`}
+            </div>
+        `;
+    }
+
+    if (isQuiz) {
+        const total = q.correct_count + q.incorrect_count;
+        const percent = total > 0 ? Math.round((q.correct_count / total) * 100) : 0;
+        return `
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
+                <p class="font-medium text-gray-900 mb-2">${index + 1}. ${escapeHtml(q.question_text)} <span class="text-xs font-normal text-gray-400">(${t(q.points === 1 ? 'quiz.point_singular' : 'quiz.point_plural', { count: q.points })})</span></p>
+                ${renderQuestionAttachmentHTML(q, `yt-embed-result-${q.question_id}`)}
+                <div class="progress-bar mb-1"><div class="progress-fill" style="width: ${percent}%"></div></div>
+                <p class="text-xs text-gray-500">${t('quiz.correct_incorrect_percent', { correct: q.correct_count, incorrect: q.incorrect_count, percent })}</p>
+            </div>
+        `;
+    }
+
+    // Encuesta de opción múltiple/verdadero-falso: no hay "correcta", solo
+    // conteo + porcentaje por opción.
+    return `
+        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-4">
+            <p class="font-medium text-gray-900 mb-3">${index + 1}. ${escapeHtml(q.question_text)}</p>
+            ${renderQuestionAttachmentHTML(q, `yt-embed-result-${q.question_id}`)}
+            <div class="space-y-2">
+                ${q.options.map((opt) => `
+                    <div>
+                        <div class="flex justify-between text-sm text-gray-600 mb-1">
+                            <span>${escapeHtml(opt.option_text)}</span>
+                            <span>${opt.count} (${opt.percent}%)</span>
+                        </div>
+                        <div class="progress-bar"><div class="progress-fill" style="width: ${opt.percent}%"></div></div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderShortAnswerRow(a, isQuiz) {
+    const statusLabel = a.is_correct == null ? t('quiz.status_pending') : (a.is_correct == 1 ? t('quiz.status_correct') : t('quiz.status_incorrect'));
+    const statusClass = a.is_correct == null ? 'text-gray-400' : (a.is_correct == 1 ? 'text-green-600' : 'text-red-600');
+    return `
+        <div class="border border-gray-100 rounded-lg p-3" data-answer-id="${a.answer_id}">
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+                <p class="text-sm font-medium text-gray-700">${escapeHtml(a.student_name)}</p>
+                ${isQuiz ? `<span class="text-xs font-semibold ${statusClass}">${statusLabel}</span>` : ''}
+            </div>
+            <p class="text-sm text-gray-600 mt-1 whitespace-pre-line">${escapeHtml(a.answer_text || '')}</p>
+            ${isQuiz ? `
+                <div class="flex gap-2 mt-2">
+                    <button onclick="gradeAnswerHandler(${a.answer_id}, true, this)" class="text-xs px-3 py-1 rounded-lg transition ${a.is_correct == 1 ? 'bg-green-600 text-white' : 'bg-green-50 text-green-700 hover:bg-green-100'}">
+                        <i class="fas fa-check mr-1"></i> ${t('quiz.status_correct')}
+                    </button>
+                    <button onclick="gradeAnswerHandler(${a.answer_id}, false, this)" class="text-xs px-3 py-1 rounded-lg transition ${a.is_correct == 0 ? 'bg-red-600 text-white' : 'bg-red-50 text-red-700 hover:bg-red-100'}">
+                        <i class="fas fa-times mr-1"></i> ${t('quiz.status_incorrect')}
+                    </button>
+                </div>
+            ` : ''}
+        </div>
+    `;
+}
+
+async function gradeAnswerHandler(answerId, isCorrect, btn) {
+    // Deshabilita ambos botones (Correcta/Incorrecta) de esta fila mientras
+    // se espera la respuesta — sin esto, un doble clic rápido podía
+    // disparar dos calificaciones para la misma respuesta.
+    const buttons = btn?.parentElement ? btn.parentElement.querySelectorAll('button') : [];
+    buttons.forEach(b => { b.disabled = true; });
+
+    try {
+        await contentsAPI.gradeAnswer(answerId, { is_correct: isCorrect });
+        showToast(t('quiz.grade_success'), 'success');
+
+        // Se actualiza SOLO esta fila. Repintar toda la vista (lo que se hacía
+        // antes) volvía a pedir y dibujar todos los resultados por cada clic
+        // — y descartaba las respuestas que el profesor ya había expandido
+        // con "Mostrar más".
+        const answer = resultAnswersById.get(answerId);
+        const row = document.querySelector(`[data-answer-id="${answerId}"]`);
+        if (answer && row) {
+            answer.is_correct = isCorrect ? 1 : 0;
+            row.outerHTML = renderShortAnswerRow(answer, currentResultsIsQuiz);
+        } else {
+            renderQuizResults({ id: currentQuizContentId });
+        }
+    } catch (error) {
+        showToast(error.message || t('quiz.grade_failed'), 'error');
+        buttons.forEach(b => { b.disabled = false; });
+    }
+}
+
+window.gradeAnswerHandler = gradeAnswerHandler;
+
+/**
+ * "Mostrar más" de una pregunta de respuesta corta: pide la siguiente página
+ * de respuestas y las agrega al final de la lista, sin tocar el resto de la
+ * vista.
+ */
+async function showMoreShortAnswers(questionId, btn) {
+    const list = document.getElementById(`short-answers-${questionId}`);
+    if (!list) return;
+
+    const loaded = Number(list.dataset.loaded);
+    const total = Number(list.dataset.total);
+    btn.disabled = true;
+
+    try {
+        const page = Math.floor(loaded / SHORT_ANSWERS_PAGE_SIZE) + 1;
+        const response = await contentsAPI.getShortAnswers(currentQuizContentId, questionId, { page, limit: SHORT_ANSWERS_PAGE_SIZE });
+        const answers = response.data.answers || [];
+
+        answers.forEach((a) => resultAnswersById.set(a.answer_id, a));
+        list.insertAdjacentHTML('beforeend', answers.map((a) => renderShortAnswerRow(a, currentResultsIsQuiz)).join(''));
+
+        const nowLoaded = loaded + answers.length;
+        list.dataset.loaded = String(nowLoaded);
+        if (answers.length > 0 && nowLoaded < total) {
+            btn.innerHTML = `<i class="fas fa-chevron-down mr-1"></i> ${t('quiz.show_more_answers', { remaining: total - nowLoaded })}`;
+            btn.disabled = false;
+        } else {
+            btn.remove();
+        }
+    } catch (error) {
+        showToast(error.message || t('quiz.results_load_failed'), 'error');
+        btn.disabled = false;
+    }
+}
+
+window.showMoreShortAnswers = showMoreShortAnswers;

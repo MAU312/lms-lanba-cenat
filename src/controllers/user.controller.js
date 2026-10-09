@@ -1,0 +1,599 @@
+import bcrypt from 'bcryptjs';
+import User from '../models/User.js';
+import Course from '../models/Course.js';
+import TaskSubmission from '../models/TaskSubmission.js';
+import { deleteFile } from '../middlewares/upload.middleware.js';
+import { parseCsv } from '../utils/csv.js';
+import { generateTempPassword } from '../utils/password.js';
+import mailer from '../config/mailer.js';
+import { t } from '../utils/i18n.js';
+import { parsePagination, buildPagination } from '../utils/pagination.js';
+import { exceedsFieldLimit } from '../middlewares/validateFieldLengths.middleware.js';
+import { EMAIL_REGEX, USERNAME_REGEX, PASSWORD_MIN_LENGTH } from '../utils/validators.js';
+
+const VALID_ROLES = ['admin', 'student', 'teacher'];
+
+// Los 4 guards de "no podés tocar tu propia cuenta" de abajo comparan
+// `req.session.user.id === parseInt(req.params.id)`. parseInt lee solo el
+// PREFIJO numérico ("120abc" -> 120), pero la fila que realmente se
+// actualiza/borra la decide MySQL comparando el string COMPLETO contra una
+// columna INT — en modo no estricto, MySQL coacciona ese mismo string a su
+// propio prefijo numérico (ej. "1.2e2" -> 120 por notación científica) y
+// termina afectando la misma fila que el guard creyó estar protegiendo. Sin
+// esta validación, `PUT /users/1.2e2/toggle-active` desactivaba al propio
+// admin que lo llamaba, pasando por encima del guard. Se valida acá (una
+// sola vez, antes de los 4 usos) que el id sea EXACTAMENTE una secuencia de
+// dígitos — cualquier otra cosa se trata igual que un id que no existe.
+const NUMERIC_ID_REGEX = /^\d+$/;
+function isValidId(id) {
+  return NUMERIC_ID_REGEX.test(String(id));
+}
+
+/**
+ * `isAdmin` (el middleware de ruta, ver auth.middleware.js) deja pasar a
+ * un profesor con `admin_access` igual que a un admin real
+ * (`hasAdminAccess`, intencional: puede gestionar cursos/usuarios
+ * estudiantes/profesores). Pero crear/tocar una cuenta `role==='admin'`
+ * real es un nivel más — sin esto, ese mismo profesor podía crear otros
+ * admins, degradar/desactivar/eliminar a los admins reales, y hasta
+ * auto-promoverse a `role: 'admin'` real editando su propia fila. Las 4
+ * funciones de abajo que tocan el nivel admin usan esto, no `hasAdminAccess`.
+ */
+function isRealAdmin(user) {
+  return Boolean(user && user.role === 'admin');
+}
+// Tope conservador: cada fila potencialmente manda un correo real por Gmail
+// SMTP (ver mailer.js), y una cuenta gratuita de Gmail tiene un límite de
+// ~500 envíos/día compartido con los correos de recuperación de contraseña
+// — una importación enorme de un solo saque podría agotarlo para el resto
+// del día.
+const CSV_IMPORT_MAX_ROWS = 100;
+
+/**
+ * POST /api/users
+ * Crea un usuario directo desde el panel de admin, con el rol que se
+ * indique (a diferencia del registro público, que siempre crea 'student').
+ * Evita que un admin tenga que cerrar su sesión para registrar profesores
+ * o estudiantes.
+ */
+export const createUser = async (req, res) => {
+  try {
+    const { name, email, username, password, role } = req.body;
+
+    if (!name || !email || !password || !role) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.name_email_password_role_required') });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    if (!EMAIL_REGEX.test(normalizedEmail)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.invalid_email_format') });
+    }
+
+    if (!VALID_ROLES.includes(role)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.invalid_role') });
+    }
+
+    // Solo un admin real puede crear OTRO admin — un profesor con
+    // admin_access puede crear profesores/estudiantes, no agrandar el
+    // círculo de administradores.
+    if (role === 'admin' && !isRealAdmin(req.session.user)) {
+      return res.status(403).json({ success: false, message: t(req.locale, 'errors.real_admin_required') });
+    }
+
+    if (String(password).length < PASSWORD_MIN_LENGTH) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.password_min_length') });
+    }
+
+    let normalizedUsername = null;
+    if (username && String(username).trim()) {
+      normalizedUsername = String(username).trim();
+      if (!USERNAME_REGEX.test(normalizedUsername)) {
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.invalid_username_format')
+        });
+      }
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    try {
+      const userId = await User.create({
+        name: String(name).trim(),
+        username: normalizedUsername,
+        email: normalizedEmail,
+        password: hashedPassword,
+        role
+      });
+      res.status(201).json({ success: true, message: t(req.locale, 'success.user_created'), data: { id: userId } });
+    } catch (dbError) {
+      if (dbError.code === 'ER_DUP_ENTRY') {
+        return res.status(400).json({ success: false, message: t(req.locale, 'errors.email_or_username_taken') });
+      }
+      throw dbError;
+    }
+  } catch (error) {
+    console.error('Error al crear usuario:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.create_user_failed') });
+  }
+};
+
+/**
+ * GET /api/users
+ */
+export const getAllUsers = async (req, res) => {
+  try {
+    const { page, limit } = parsePagination(req.query, 10);
+    const search = String(req.query.search || '').trim();
+
+    const { rows, total } = await User.findAll({ page, limit, search });
+
+    res.json({
+      success: true,
+      data: rows,
+      pagination: buildPagination(page, limit, total)
+    });
+  } catch (error) {
+    console.error('Error al obtener usuarios:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_users_failed') });
+  }
+};
+
+/**
+ * GET /api/users/:id
+ */
+export const getUserById = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+    res.json({ success: true, data: user });
+  } catch (error) {
+    console.error('Error al obtener usuario:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_user_by_id_failed') });
+  }
+};
+
+/**
+ * PUT /api/users/:id
+ */
+export const updateUser = async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+    }
+
+    const { name, email, role } = req.body;
+
+    if (!name || !email || !role) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.name_email_role_required') });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    if (!EMAIL_REGEX.test(normalizedEmail)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.invalid_email_format') });
+    }
+
+    if (!VALID_ROLES.includes(role)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.invalid_role') });
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+
+    // Un profesor con admin_access no puede tocar NINGÚN dato de una
+    // cuenta que YA es admin real, ni subir a nadie (incluido él mismo) a
+    // role: 'admin' — sin esto, podía editar/renombrar a un admin real, o
+    // mandar su propia fila con role: 'admin' y promoverse a admin
+    // permanente sin que nadie más interviniera.
+    if (!isRealAdmin(req.session.user) && (user.role === 'admin' || role === 'admin')) {
+      return res.status(403).json({ success: false, message: t(req.locale, 'errors.real_admin_required') });
+    }
+
+    // Evita que un admin se quite su propio rol por accidente (por ejemplo
+    // desde el selector de rol en la tabla de usuarios) y quede bloqueado
+    // del panel sin que nadie más pueda revertirlo desde la interfaz. Solo
+    // aplica si quien edita YA es admin de verdad (req.session.user.role) —
+    // si no, un profesor con admin_access (role='teacher') editando su
+    // propio nombre/email quedaba bloqueado siempre, aunque no tocara el
+    // rol: `role` acá es el nuevo valor propuesto, que para esa persona
+    // siempre es 'teacher' (su único rol real).
+    if (
+      req.session.user.id === parseInt(req.params.id) &&
+      req.session.user.role === 'admin' &&
+      role !== 'admin'
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.cannot_change_own_admin_role')
+      });
+    }
+
+    try {
+      await User.update(req.params.id, { name: String(name).trim(), email: normalizedEmail, role });
+    } catch (dbError) {
+      if (dbError.code === 'ER_DUP_ENTRY') {
+        return res.status(400).json({ success: false, message: t(req.locale, 'errors.email_in_use_by_other') });
+      }
+      throw dbError;
+    }
+
+    res.json({ success: true, message: t(req.locale, 'success.user_updated') });
+  } catch (error) {
+    console.error('Error al actualizar usuario:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.update_user_failed') });
+  }
+};
+
+/**
+ * PUT /api/users/:id/toggle-active
+ * Activar o desactivar un usuario
+ */
+export const toggleUserActive = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+    }
+
+    // No permitir que el admin se desactive a sí mismo
+    if (req.session.user.id === parseInt(id)) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.cannot_deactivate_own_account')
+      });
+    }
+
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+
+    // Un profesor con admin_access no puede activar/desactivar a un admin
+    // real (ver updateUser, mismo criterio).
+    if (user.role === 'admin' && !isRealAdmin(req.session.user)) {
+      return res.status(403).json({ success: false, message: t(req.locale, 'errors.real_admin_required') });
+    }
+
+    const newState = !user.is_active;
+    await User.toggleActive(id, newState);
+
+    res.json({
+      success: true,
+      message: newState ? t(req.locale, 'success.user_activated') : t(req.locale, 'success.user_deactivated'),
+      data: { is_active: newState }
+    });
+  } catch (error) {
+    console.error('Error al cambiar estado del usuario:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.toggle_user_active_failed') });
+  }
+};
+
+/**
+ * PUT /api/users/:id/admin-access
+ * Da o quita a un profesor el acceso adicional de administrador (doble
+ * rol profesor+admin) — solo aplica a usuarios con role='teacher'.
+ */
+export const setUserAdminAccess = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_access } = req.body;
+
+    if (!isValidId(id)) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+    }
+
+    // Mismo guard que toggleUserActive/deleteUser: sin esto, un profesor
+    // con admin_access podía quitárselo a sí mismo con un clic (sin
+    // confirmación ni chequeo de "sos el último admin"), y si era el
+    // único con privilegios de admin activos quedaba sin forma de
+    // revertirlo desde la interfaz.
+    if (req.session.user.id === parseInt(id)) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.cannot_change_own_admin_role')
+      });
+    }
+
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+
+    if (user.role !== 'teacher') {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.admin_access_teacher_only')
+      });
+    }
+
+    const newState = Boolean(admin_access);
+    await User.setAdminAccess(id, newState);
+
+    res.json({
+      success: true,
+      message: newState ? t(req.locale, 'success.admin_access_granted') : t(req.locale, 'success.admin_access_revoked'),
+      data: { admin_access: newState }
+    });
+  } catch (error) {
+    console.error('Error al cambiar el acceso de administrador:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.update_admin_access_failed') });
+  }
+};
+
+/**
+ * POST /api/users/bulk-import
+ * Crea varios estudiantes de una sola vez desde un CSV (columnas "nombre"
+ * y "email", en cualquier orden — también acepta "name"/"correo"). A cada
+ * uno se le genera una contraseña temporal y se le envía por correo. Si
+ * viene `course_id`, además se matricula a cada uno en ese curso (tanto
+ * los recién creados como los que ya existían con ese email).
+ */
+export const bulkImportUsers = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.csv_file_required') });
+    }
+
+    const courseId = req.body.course_id ? parseInt(req.body.course_id) : null;
+    let course = null;
+    if (courseId) {
+      course = await Course.findById(courseId);
+      if (!course) return res.status(404).json({ success: false, message: t(req.locale, 'errors.course_not_found') });
+      // Mismo guard que enrollCourse: un curso hijo de módulo no es
+      // inscribible por su cuenta (la inscripción real vive en el padre) —
+      // sin esto, cada fila del CSV crearía una inscripción fantasma que
+      // nunca recibe progreso real.
+      if (course.parent_module_id) {
+        return res.status(400).json({
+          success: false,
+          message: course.parent_course_title
+            ? t(req.locale, 'errors.enroll_in_parent_required_titled', { title: course.parent_course_title })
+            : t(req.locale, 'errors.enroll_in_parent_required')
+        });
+      }
+    }
+
+    const { headers, rows } = parseCsv(req.file.buffer.toString('utf8'));
+    const nameKey = headers.find((h) => ['nombre', 'name'].includes(h));
+    const emailKey = headers.find((h) => ['email', 'correo', 'correo electronico', 'correo electrónico'].includes(h));
+
+    if (!nameKey || !emailKey) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.csv_missing_columns')
+      });
+    }
+    if (rows.length === 0) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.csv_no_rows') });
+    }
+    if (rows.length > CSV_IMPORT_MAX_ROWS) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.csv_too_many_rows', { max: CSV_IMPORT_MAX_ROWS })
+      });
+    }
+
+    const results = [];
+    let created = 0;
+    let skipped = 0;
+    // Los correos de bienvenida se mandan DESPUÉS de responder (ver el
+    // final de esta función) — se acumulan acá en vez de esperarse uno por
+    // uno dentro del loop, que bloqueaba la respuesta hasta 100 envíos SMTP
+    // reales seguidos (hasta ~1 min con Gmail). Se mandan igual de a uno
+    // (no todos a la vez): disparar hasta 100 conexiones SMTP simultáneas al
+    // mismo Gmail sí arriesgaba que Gmail las rechazara/limitara por ráfaga.
+    const pendingWelcomeEmails = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const rowNum = i + 2; // +1 por el encabezado, +1 porque la fila 1 humana es la primera de datos
+      const name = String(rows[i][nameKey] || '').trim();
+      const email = String(rows[i][emailKey] || '').trim().toLowerCase();
+
+      // Un nombre/email más largo que la columna (100) fallaba recién en el
+      // INSERT y se reportaba como un genérico "no se pudo crear" — se trata
+      // como fila inválida, igual que un email mal formado.
+      if (!name || !email || !EMAIL_REGEX.test(email) || exceedsFieldLimit('name', name) || exceedsFieldLimit('email', email)) {
+        results.push({ row: rowNum, email: email || null, status: 'error', message: t(req.locale, 'errors.row_invalid_name_email') });
+        continue;
+      }
+
+      const existingUser = await User.findByEmail(email);
+      if (existingUser) {
+        skipped++;
+        if (courseId) {
+          const enrolled = await Course.enrollUser(courseId, existingUser.id);
+          results.push({
+            row: rowNum,
+            email,
+            status: 'skipped_existing',
+            message: enrolled ? t(req.locale, 'success.row_existing_enrolled') : t(req.locale, 'success.row_existing_already_enrolled')
+          });
+        } else {
+          results.push({ row: rowNum, email, status: 'skipped_existing', message: t(req.locale, 'success.row_existing_account') });
+        }
+        continue;
+      }
+
+      const tempPassword = generateTempPassword();
+      const hashedPassword = await bcrypt.hash(tempPassword, 10);
+
+      let userId;
+      try {
+        userId = await User.create({ name, email, password: hashedPassword, role: 'student' });
+      } catch (dbError) {
+        results.push({ row: rowNum, email, status: 'error', message: t(req.locale, 'errors.row_create_failed') });
+        continue;
+      }
+
+      if (courseId) {
+        await Course.enrollUser(courseId, userId);
+      }
+
+      pendingWelcomeEmails.push({ toEmail: email, name, tempPassword, courseTitle: course ? course.title : null });
+
+      created++;
+      results.push({ row: rowNum, email, status: 'created' });
+    }
+
+    res.json({
+      success: true,
+      message: t(req.locale, 'success.bulk_import_summary', { created, skipped, total: rows.length }),
+      data: { created, skipped, total: rows.length, results }
+    });
+
+    for (const welcomeEmail of pendingWelcomeEmails) {
+      try {
+        await mailer.sendWelcomeEmail(welcomeEmail);
+      } catch (emailError) {
+        console.error(`Error al enviar el correo de bienvenida a ${welcomeEmail.toEmail}:`, emailError);
+      }
+    }
+  } catch (error) {
+    console.error('Error al importar usuarios desde CSV:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.bulk_import_failed') });
+  }
+};
+
+/**
+ * DELETE /api/users/:id
+ */
+export const deleteUser = async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+    }
+
+    if (req.session.user.id === parseInt(req.params.id)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.cannot_delete_own_account') });
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: t(req.locale, 'errors.user_not_found') });
+    }
+
+    // Un profesor con admin_access no puede eliminar a un admin real (ver
+    // updateUser, mismo criterio).
+    if (user.role === 'admin' && !isRealAdmin(req.session.user)) {
+      return res.status(403).json({ success: false, message: t(req.locale, 'errors.real_admin_required') });
+    }
+
+    // Recolectar archivos (avatar + entregas de tareas que subió) ANTES de
+    // borrar — las filas correspondientes se van solas en cascada (FK ON
+    // DELETE CASCADE en user_id), pero eso nunca toca el disco. Se borran
+    // recién después de confirmar el DELETE en BD, mismo criterio que
+    // deleteCourse/deleteContent.
+    const submissions = await TaskSubmission.findAllByUser(req.params.id);
+    const filesToDelete = [];
+    if (user.avatar_url) filesToDelete.push(user.avatar_url);
+    submissions.forEach(submission => { if (submission.file_url) filesToDelete.push(submission.file_url); });
+
+    const deleted = await User.delete(req.params.id);
+    if (!deleted) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.delete_user_no_rows') });
+    }
+
+    await Promise.all(filesToDelete.map(deleteFile));
+
+    res.json({ success: true, message: t(req.locale, 'success.user_deleted') });
+  } catch (error) {
+    console.error('Error al eliminar usuario:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.delete_user_failed') });
+  }
+};
+
+/**
+ * GET /api/users/by-role/:role
+ * Lista simple de usuarios activos con un rol dado (ej. para poblar el
+ * selector de profesores al crear/editar un curso).
+ */
+export const getUsersByRole = async (req, res) => {
+  try {
+    const { role } = req.params;
+
+    if (!VALID_ROLES.includes(role)) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.invalid_role') });
+    }
+
+    const users = await User.findByRole(role);
+    res.json({ success: true, data: users });
+  } catch (error) {
+    console.error('Error al obtener usuarios por rol:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_users_failed') });
+  }
+};
+
+/**
+ * GET /api/users/stats/count
+ */
+export const getUserStats = async (req, res) => {
+  try {
+    const stats = await User.countByRole();
+    res.json({ success: true, data: stats });
+  } catch (error) {
+    console.error('Error al obtener estadísticas de usuarios:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.get_stats_failed') });
+  }
+};
+
+/**
+ * PUT /api/users/me/avatar
+ * Cualquier usuario logueado sube/reemplaza SU PROPIA foto de perfil (no
+ * hay endpoint para que un admin le suba una foto a otro usuario). El
+ * archivo anterior se borra recién después de confirmar el UPDATE en BD
+ * — mismo motivo que en Content.updateContent: si se borrara antes y el
+ * UPDATE fallara, la BD quedaría apuntando a un archivo que ya no existe.
+ */
+export const updateMyAvatar = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.image_required') });
+    }
+
+    const userId = req.session.user.id;
+    const previousAvatarUrl = req.session.user.avatar_url;
+    const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+
+    const updated = await User.updateAvatar(userId, avatarUrl);
+
+    if (!updated) {
+      await deleteFile(avatarUrl);
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.avatar_update_no_rows') });
+    }
+
+    if (previousAvatarUrl) {
+      await deleteFile(previousAvatarUrl);
+    }
+
+    req.session.user.avatar_url = avatarUrl;
+
+    res.json({ success: true, message: t(req.locale, 'success.avatar_updated'), data: { avatar_url: avatarUrl } });
+  } catch (error) {
+    console.error('Error al actualizar la foto de perfil:', error);
+    if (req.file) {
+      await deleteFile(`/uploads/avatars/${req.file.filename}`);
+    }
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.avatar_update_failed') });
+  }
+};
+
+/**
+ * DELETE /api/users/me/avatar
+ * Quita la foto de perfil propia (vuelve al círculo con la inicial).
+ */
+export const removeMyAvatar = async (req, res) => {
+  try {
+    const userId = req.session.user.id;
+    const previousAvatarUrl = req.session.user.avatar_url;
+
+    if (!previousAvatarUrl) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.no_avatar_to_remove') });
+    }
+
+    await User.updateAvatar(userId, null);
+    await deleteFile(previousAvatarUrl);
+    req.session.user.avatar_url = null;
+
+    res.json({ success: true, message: t(req.locale, 'success.avatar_removed') });
+  } catch (error) {
+    console.error('Error al quitar la foto de perfil:', error);
+    res.status(500).json({ success: false, message: t(req.locale, 'errors.avatar_remove_failed') });
+  }
+};

@@ -1,0 +1,88 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { parseCsv, toCsv } from '../../src/utils/csv.js';
+
+test('parseCsv: encabezados en minúscula y una fila simple', () => {
+  const { headers, rows } = parseCsv('Nombre,Email\nAna Rojas,ana@test.com');
+  assert.deepEqual(headers, ['nombre', 'email']);
+  assert.deepEqual(rows, [{ nombre: 'Ana Rojas', email: 'ana@test.com' }]);
+});
+
+test('parseCsv: soporta CRLF y descarta líneas vacías', () => {
+  const { rows } = parseCsv('nombre,email\r\nAna,ana@test.com\r\n\r\nCarlos,carlos@test.com\r\n');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].email, 'carlos@test.com');
+});
+
+test('parseCsv: campo entre comillas con una coma adentro no se parte en dos columnas', () => {
+  const { rows } = parseCsv('nombre,email\n"Pérez, Juan",juan@test.com');
+  assert.equal(rows[0].nombre, 'Pérez, Juan');
+  assert.equal(rows[0].email, 'juan@test.com');
+});
+
+test('parseCsv: comillas escapadas ("") dentro de un campo entre comillas', () => {
+  const { rows } = parseCsv('nombre,email\n"Ana ""la crack"" Rojas",ana@test.com');
+  assert.equal(rows[0].nombre, 'Ana "la crack" Rojas');
+});
+
+test('parseCsv: detecta ";" como separador (Excel es-CR/es-ES, donde "," es el decimal)', () => {
+  const { headers, rows } = parseCsv('Nombre;Email\nAna Rojas;ana@test.com\nCarlos;carlos@test.com');
+  assert.deepEqual(headers, ['nombre', 'email']);
+  assert.deepEqual(rows, [{ nombre: 'Ana Rojas', email: 'ana@test.com' }, { nombre: 'Carlos', email: 'carlos@test.com' }]);
+});
+
+test('parseCsv: un campo entre comillas con "," no hace que se detecte ";" por error', () => {
+  const { headers, rows } = parseCsv('nombre,email\n"Pérez, Juan;Ana",juan@test.com');
+  assert.deepEqual(headers, ['nombre', 'email']);
+  assert.equal(rows[0].nombre, 'Pérez, Juan;Ana');
+});
+
+test('parseCsv: texto vacío devuelve headers y rows vacíos', () => {
+  const { headers, rows } = parseCsv('');
+  assert.deepEqual(headers, []);
+  assert.deepEqual(rows, []);
+});
+
+test('parseCsv: solo encabezado, sin filas de datos', () => {
+  const { rows } = parseCsv('nombre,email');
+  assert.deepEqual(rows, []);
+});
+
+// =================================
+// toCsv
+// =================================
+
+test('toCsv: arma encabezados + filas separados por coma, terminados en CRLF', () => {
+  const csv = toCsv(['Nombre', 'Nota'], [['Ana', 85], ['Beto', 92]]);
+  assert.equal(csv, 'Nombre,Nota\r\nAna,85\r\nBeto,92');
+});
+
+test('toCsv: envuelve en comillas un campo que contiene una coma, escapando comillas internas', () => {
+  const csv = toCsv(['Nombre'], [['Pérez, Juan "el crack"']]);
+  assert.equal(csv, 'Nombre\r\n"Pérez, Juan ""el crack"""');
+});
+
+test('toCsv: null/undefined se escriben como campo vacío, no como el texto "null"', () => {
+  const csv = toCsv(['A', 'B'], [[null, undefined]]);
+  assert.equal(csv, 'A,B\r\n,');
+});
+
+test('toCsv: antepone un apóstrofe a un campo que empieza con =, +, -, @ (inyección de fórmulas CSV)', () => {
+  const csv = toCsv(['Nombre'], [
+    ['=1+1'],
+    ['+1+1'],
+    ['-1+1'],
+    ['@SUM(A1)']
+  ]);
+  assert.equal(csv, "Nombre\r\n'=1+1\r\n'+1+1\r\n'-1+1\r\n'@SUM(A1)");
+});
+
+test('toCsv: un campo peligroso que además tiene una coma queda apostrofado Y entre comillas', () => {
+  const csv = toCsv(['Nombre'], [['=HYPERLINK(1,2)']]);
+  assert.equal(csv, 'Nombre\r\n"\'=HYPERLINK(1,2)"');
+});
+
+test('toCsv: un valor que NO empieza con =+-@ no se toca (ej. un nombre real con guion)', () => {
+  const csv = toCsv(['Nombre'], [['Ana-María']]);
+  assert.equal(csv, 'Nombre\r\nAna-María');
+});

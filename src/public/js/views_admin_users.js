@@ -1,0 +1,509 @@
+/**
+ * Views - Administración de Usuarios (con paginación y toggle activo)
+ */
+
+const USERS_PER_PAGE = 10;
+let currentUserPage = 1;
+let currentUserSearch = '';
+let currentPageUsers = [];
+let currentUsersPagination = { total: 0, totalPages: 1 };
+const adminUsersRequestGuard = createStaleResponseGuard();
+// Función que desactiva la accesibilidad del modal actualmente abierto
+// (crear usuario o import CSV, nunca los dos a la vez) — se guarda acá para
+// llamarla desde la función de cierre correspondiente. La lógica de
+// Escape/foco/trampa de Tab vive en activateModalA11y (utils.js), compartida
+// con confirmAction y promptText.
+let deactivateActiveModal = null;
+
+function setupModalA11y(modal, closeFn) {
+    if (deactivateActiveModal) deactivateActiveModal();
+    const firstField = modal.querySelector('input, select, textarea');
+    deactivateActiveModal = activateModalA11y(modal, { onClose: closeFn, initialFocus: firstField });
+}
+
+function teardownModalA11y() {
+    if (deactivateActiveModal) {
+        deactivateActiveModal();
+        deactivateActiveModal = null;
+    }
+}
+
+window.renderAdminUsers = async function(params) {
+    const app = document.getElementById('app');
+    showLoading();
+    currentUserPage = 1;
+    currentUserSearch = '';
+
+    app.innerHTML = renderAdminLayout(`
+        <div class="flex items-center justify-between mb-6 gap-4 flex-wrap">
+            <h1 class="text-2xl font-bold text-gray-900 dark:text-white">
+                <i class="fas fa-users text-cenat-green mr-2"></i>
+                ${t('admin.users.title')}
+            </h1>
+            <div class="flex gap-2">
+                <button onclick="openBulkImportModal()" class="border border-cenat-green text-cenat-green px-4 py-2 rounded-lg text-sm font-semibold hover:bg-green-50 dark:hover:bg-slate-700 transition">
+                    <i class="fas fa-file-csv"></i> ${t('admin.users.import_csv')}
+                </button>
+                <button onclick="openCreateUserModal()" class="btn-cenat">
+                    <i class="fas fa-user-plus"></i> ${t('admin.users.create_user')}
+                </button>
+            </div>
+        </div>
+
+        <div class="relative mb-4">
+            <input type="text" id="search-admin-users" placeholder="${escapeAttr(t('admin.users.search_placeholder'))}" aria-label="${escapeAttr(t('admin.users.search_placeholder'))}"
+                class="w-full pl-10 pr-4 py-2 border border-gray-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cenat-green">
+            <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"></i>
+        </div>
+
+        <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-gray-100 dark:border-slate-700 overflow-hidden">
+            <div id="users-table-container"></div>
+            <div id="users-pagination" class="px-4 py-3 border-t border-gray-100 dark:border-slate-700"></div>
+        </div>
+    `, 'users');
+
+    document.getElementById('search-admin-users').addEventListener('input', debounce(async (e) => {
+        currentUserSearch = e.target.value.trim();
+        announceResultCount(await loadAdminUsers(1));
+    }, 300));
+
+    await loadAdminUsers(1);
+};
+
+function openCreateUserModal() {
+    closeCreateUserModal();
+
+    const modal = document.createElement('div');
+    modal.id = 'create-user-modal';
+    modal.className = 'fixed inset-0 z-50 flex items-center justify-center px-4';
+    modal.innerHTML = `
+        <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" onclick="closeCreateUserModal()"></div>
+        <div class="relative bg-white dark:bg-slate-800 rounded-2xl shadow-2xl p-6 max-w-md w-full fade-in" role="dialog" aria-modal="true" aria-labelledby="create-user-modal-title">
+            <div class="flex items-center justify-between mb-4">
+                <h2 id="create-user-modal-title" class="text-xl font-bold text-gray-900 dark:text-white">
+                    <i class="fas fa-user-plus text-cenat-green mr-2"></i> ${t('admin.users.createModal.title')}
+                </h2>
+                <button type="button" onclick="closeCreateUserModal()" class="p-2 -m-2 rounded text-gray-400 hover:text-gray-600 dark:hover:text-slate-200" aria-label="${escapeAttr(t('common.close'))}">
+                    <i class="fas fa-times text-lg" aria-hidden="true"></i>
+                </button>
+            </div>
+
+            <form id="create-user-form" class="space-y-4">
+                <div>
+                    <label for="new-user-name" class="block text-sm font-medium text-gray-700 dark:text-slate-300 mb-1">${t('admin.users.createModal.name_label')}</label>
+                    <input type="text" id="new-user-name" autocomplete="off" required maxlength="100"
+                        class="w-full px-3 py-2 border border-gray-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                </div>
+                <div>
+                    <label for="new-user-email" class="block text-sm font-medium text-gray-700 dark:text-slate-300 mb-1">${t('admin.users.createModal.email_label')}</label>
+                    <input type="email" id="new-user-email" autocomplete="off" required maxlength="100"
+                        class="w-full px-3 py-2 border border-gray-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                </div>
+                <div>
+                    <label for="new-user-username" class="block text-sm font-medium text-gray-700 dark:text-slate-300 mb-1">${t('admin.users.createModal.username_label')}</label>
+                    <input type="text" id="new-user-username" autocomplete="off" minlength="3" maxlength="50"
+                        placeholder="${t('admin.users.createModal.username_placeholder')}"
+                        class="w-full px-3 py-2 border border-gray-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                </div>
+                <div>
+                    <label for="new-user-password" class="block text-sm font-medium text-gray-700 dark:text-slate-300 mb-1">${t('admin.users.createModal.password_label')}</label>
+                    <input type="password" id="new-user-password" autocomplete="new-password" required minlength="6"
+                        placeholder="${t('auth.register.password_hint')}"
+                        class="w-full px-3 py-2 border border-gray-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                </div>
+                <div>
+                    <label for="new-user-role" class="block text-sm font-medium text-gray-700 dark:text-slate-300 mb-1">${t('admin.users.createModal.role_label')}</label>
+                    <select id="new-user-role"
+                        class="w-full px-3 py-2 border border-gray-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                        <option value="student" selected>${t('admin.users.role_student')}</option>
+                        <option value="teacher">${t('admin.users.role_teacher')}</option>
+                        <option value="admin">${t('admin.users.role_admin')}</option>
+                    </select>
+                </div>
+
+                <div class="flex items-center gap-3 pt-2">
+                    <button type="submit" class="btn-cenat flex-1">${t('admin.users.createModal.submit')}</button>
+                    <button type="button" onclick="closeCreateUserModal()" class="text-gray-600 dark:text-slate-300 px-4 py-2 text-sm">
+                        ${t('contentManager.cancel')}
+                    </button>
+                </div>
+            </form>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    setupModalA11y(modal, closeCreateUserModal);
+
+    document.getElementById('create-user-form').addEventListener('submit', handleCreateUserSubmit);
+}
+
+function closeCreateUserModal() {
+    const modal = document.getElementById('create-user-modal');
+    if (modal) modal.remove();
+    teardownModalA11y();
+}
+
+async function handleCreateUserSubmit(e) {
+    e.preventDefault();
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    const originalText = submitBtn.textContent;
+
+    const data = {
+        name: document.getElementById('new-user-name').value.trim(),
+        email: document.getElementById('new-user-email').value.trim(),
+        username: document.getElementById('new-user-username').value.trim() || undefined,
+        password: document.getElementById('new-user-password').value,
+        role: document.getElementById('new-user-role').value
+    };
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = t('contentManager.creating');
+
+    try {
+        await usersAPI.create(data);
+        showToast(t('admin.users.createModal.created'), 'success');
+        closeCreateUserModal();
+        loadAdminUsers(currentUserPage);
+    } catch (error) {
+        showToast(error.message || t('admin.users.createModal.create_failed'), 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = originalText;
+    }
+}
+
+window.openCreateUserModal = openCreateUserModal;
+window.closeCreateUserModal = closeCreateUserModal;
+
+// =================================
+// Importar usuarios masivamente desde CSV
+// =================================
+
+async function openBulkImportModal() {
+    closeBulkImportModal();
+
+    const modal = document.createElement('div');
+    modal.id = 'bulk-import-modal';
+    modal.className = 'fixed inset-0 z-50 flex items-center justify-center px-4';
+    modal.innerHTML = `
+        <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" onclick="closeBulkImportModal()"></div>
+        <div class="relative bg-white dark:bg-slate-800 rounded-2xl shadow-2xl p-6 max-w-md w-full fade-in" role="dialog" aria-modal="true" aria-labelledby="bulk-import-modal-title">
+            <div class="flex items-center justify-between mb-4">
+                <h2 id="bulk-import-modal-title" class="text-xl font-bold text-gray-900 dark:text-white">
+                    <i class="fas fa-file-csv text-cenat-green mr-2"></i> ${t('admin.users.bulkImport.title')}
+                </h2>
+                <button type="button" onclick="closeBulkImportModal()" class="p-2 -m-2 rounded text-gray-400 hover:text-gray-600 dark:hover:text-slate-200" aria-label="${escapeAttr(t('common.close'))}">
+                    <i class="fas fa-times text-lg" aria-hidden="true"></i>
+                </button>
+            </div>
+
+            <div id="bulk-import-body">
+                <form id="bulk-import-form" class="space-y-4">
+                    <p class="text-sm text-gray-600 dark:text-slate-400">
+                        ${t('admin.users.bulkImport.description')}
+                    </p>
+                    <div>
+                        <label for="bulk-import-file" class="block text-sm font-medium text-gray-700 dark:text-slate-300 mb-1">${t('admin.users.bulkImport.file_label')}</label>
+                        <input type="file" id="bulk-import-file" accept=".csv" required
+                            class="w-full text-sm text-gray-700 dark:text-slate-300">
+                    </div>
+                    <div>
+                        <label for="bulk-import-course" class="block text-sm font-medium text-gray-700 dark:text-slate-300 mb-1">${t('admin.users.bulkImport.course_label')}</label>
+                        <select id="bulk-import-course"
+                            class="w-full px-3 py-2 border border-gray-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                            <option value="">${t('admin.users.bulkImport.no_course_option')}</option>
+                        </select>
+                        <p id="bulk-import-course-truncated-note" class="hidden text-xs text-yellow-600 dark:text-yellow-400 mt-1"></p>
+                    </div>
+
+                    <div class="flex items-center gap-3 pt-2">
+                        <button type="submit" class="btn-cenat flex-1">${t('admin.users.bulkImport.submit')}</button>
+                        <button type="button" onclick="closeBulkImportModal()" class="text-gray-600 dark:text-slate-300 px-4 py-2 text-sm">
+                            ${t('contentManager.cancel')}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    setupModalA11y(modal, closeBulkImportModal);
+
+    document.getElementById('bulk-import-form').addEventListener('submit', handleBulkImportSubmit);
+
+    // Poblar el selector de cursos en paralelo — si falla, se deja usable
+    // igual (solo queda sin la opción de matricular).
+    try {
+        // scope: 'top' — un curso hijo de módulo no es inscribible por su
+        // cuenta (la inscripción real vive en el padre), así que no tiene
+        // sentido ofrecerlo acá. limit:50 porque el backend igual lo
+        // capea ahí (ver Math.min(50, ...) en getAllCourses) — pedir 100
+        // sugería un tope que en realidad nunca se aplicaba.
+        const response = await coursesAPI.getAll({ limit: 50, scope: 'top' });
+        const select = document.getElementById('bulk-import-course');
+        if (select) {
+            (response.data || []).forEach(course => {
+                const option = document.createElement('option');
+                option.value = course.id;
+                option.textContent = course.title;
+                select.appendChild(option);
+            });
+        }
+        // Si hay más cursos de los que trajo esta página, decirlo — antes
+        // los que quedaban fuera del límite simplemente no aparecían, sin
+        // ningún aviso de que la lista estaba incompleta.
+        const total = response.pagination?.total ?? 0;
+        const shown = (response.data || []).length;
+        const truncatedNote = document.getElementById('bulk-import-course-truncated-note');
+        if (truncatedNote && total > shown) {
+            truncatedNote.textContent = t('admin.users.bulkImport.course_list_truncated', { shown, total });
+            truncatedNote.classList.remove('hidden');
+        }
+    } catch (error) {
+        console.error('Error al cargar los cursos para importar:', error);
+    }
+}
+
+function closeBulkImportModal() {
+    const modal = document.getElementById('bulk-import-modal');
+    if (modal) modal.remove();
+    teardownModalA11y();
+}
+
+async function handleBulkImportSubmit(e) {
+    e.preventDefault();
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    const file = document.getElementById('bulk-import-file').files[0];
+    const courseId = document.getElementById('bulk-import-course').value;
+
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append('csv', file);
+    if (courseId) formData.append('course_id', courseId);
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = t('admin.users.bulkImport.importing');
+
+    try {
+        const response = await usersAPI.bulkImport(formData);
+        showToast(response.message, 'success');
+        renderBulkImportResults(response.data.results);
+        loadAdminUsers(currentUserPage);
+    } catch (error) {
+        showToast(error.message || t('admin.users.bulkImport.import_failed'), 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = t('admin.users.bulkImport.submit');
+    }
+}
+
+/**
+ * Reemplaza el formulario por una lista de resultados fila por fila (qué
+ * se creó, qué se omitió y por qué) — así el admin puede corregir el CSV
+ * y reintentar solo lo que falló, en vez de adivinar a partir del toast
+ * resumen.
+ */
+function renderBulkImportResults(results) {
+    const body = document.getElementById('bulk-import-body');
+    if (!body) return;
+
+    const statusBadge = {
+        created: `<span class="badge badge-active">${t('admin.users.bulkImport.status_created')}</span>`,
+        skipped_existing: `<span class="badge badge-inactive">${t('admin.users.bulkImport.status_existing')}</span>`,
+        error: `<span class="badge bg-red-100 text-red-700">${t('admin.users.bulkImport.status_error')}</span>`
+    };
+
+    body.innerHTML = `
+        <div class="max-h-80 overflow-y-auto space-y-2">
+            ${results.map(r => `
+                <div class="flex items-center justify-between gap-2 text-sm border-b border-gray-100 dark:border-slate-700 pb-2">
+                    <div class="min-w-0">
+                        <p class="text-gray-900 dark:text-white truncate">${t('admin.users.bulkImport.row_prefix', { row: r.row })}${r.email ? ' — ' + escapeHtml(r.email) : ''}</p>
+                        ${r.message ? `<p class="text-xs text-gray-500 dark:text-slate-400">${escapeHtml(r.message)}</p>` : ''}
+                    </div>
+                    ${statusBadge[r.status] || ''}
+                </div>
+            `).join('')}
+        </div>
+        <button onclick="closeBulkImportModal()" class="btn-cenat w-full mt-4">${t('admin.users.bulkImport.close')}</button>
+    `;
+}
+
+window.openBulkImportModal = openBulkImportModal;
+window.closeBulkImportModal = closeBulkImportModal;
+
+async function loadAdminUsers(page) {
+    const container = document.getElementById('users-table-container');
+    const pagination = document.getElementById('users-pagination');
+    if (!container) return;
+
+    const isStale = adminUsersRequestGuard.start();
+    const currentUserId = getCurrentUser().id;
+
+    try {
+        const response = await usersAPI.getAll({ page, limit: USERS_PER_PAGE, search: currentUserSearch });
+        if (isStale()) return;
+
+        currentUserPage = page;
+        currentPageUsers = response.data || [];
+        currentUsersPagination = response.pagination || { total: currentPageUsers.length, totalPages: 1 };
+        renderUsersTable(currentPageUsers, page, currentUserId, currentUsersPagination);
+        return currentUsersPagination.total;
+    } catch (error) {
+        if (isStale()) return;
+        console.error('Error loading users:', error);
+        showToast(t('admin.users.load_failed'), 'error');
+    }
+}
+
+function renderUsersTable(users, page, currentUserId, pagination) {
+    const container = document.getElementById('users-table-container');
+    const paginationContainer = document.getElementById('users-pagination');
+    if (!container) return;
+
+    if (users.length === 0) {
+        container.innerHTML = renderEmptyStateHTML({
+            wrapperClass: 'empty-state',
+            icon: 'fa-users',
+            titleClass: 'text-xl text-gray-600 dark:text-slate-400 font-medium',
+            title: t('admin.users.empty'),
+            subtitleHtml: `<p class="text-gray-500 dark:text-slate-500">${t('admin.users.empty_subtitle')}</p>`
+        });
+        paginationContainer.innerHTML = '';
+        return;
+    }
+
+    container.innerHTML = `
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="bg-gray-50 dark:bg-slate-700">
+                    <tr class="text-left text-gray-500 dark:text-slate-400">
+                        <th class="py-3 px-4">${t('admin.users.col_name')}</th>
+                        <th class="py-3 px-4">${t('admin.users.col_email')}</th>
+                        <th class="py-3 px-4">${t('admin.users.col_role')}</th>
+                        <th class="py-3 px-4">${t('admin.users.col_status')}</th>
+                        <th class="py-3 px-4">${t('admin.users.col_registered')}</th>
+                        <th class="py-3 px-4">${t('admin.users.col_last_login')}</th>
+                        <th class="py-3 px-4 text-right">${t('admin.users.col_actions')}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${users.map(user => {
+                        const isMe = user.id === currentUserId;
+                        const isActive = user.is_active == 1 || user.is_active === true;
+                        return `
+                        <tr class="border-t border-gray-100 dark:border-slate-700 hover:bg-gray-50 dark:hover:bg-slate-700 ${!isActive ? 'opacity-60' : ''}">
+                            <td class="py-3 px-4 font-medium text-gray-900 dark:text-white">
+                                ${escapeHtml(user.name)}
+                                ${isMe ? `<span class="text-xs text-gray-400 ml-1">${t('admin.users.you_marker')}</span>` : ''}
+                            </td>
+                            <td class="py-3 px-4 text-gray-600 dark:text-slate-300">${escapeHtml(user.email)}</td>
+                            <td class="py-3 px-4">
+                                <select onchange="changeUserRole(${user.id}, this.value)"
+                                    aria-label="${escapeAttr(t('admin.users.role_select_aria', { name: user.name }))}"
+                                    class="badge ${user.role === 'admin' ? 'badge-admin' : user.role === 'teacher' ? 'badge-teacher' : 'badge-student'} border-0 cursor-pointer"
+                                    ${isMe ? 'disabled' : ''}>
+                                    <option value="student" ${user.role === 'student' ? 'selected' : ''}>${t('admin.users.role_student')}</option>
+                                    <option value="teacher" ${user.role === 'teacher' ? 'selected' : ''}>${t('admin.users.role_teacher')}</option>
+                                    <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>${t('admin.users.role_admin')}</option>
+                                </select>
+                                ${user.role === 'teacher' ? `
+                                    <button onclick="toggleUserAdminAccess(${user.id})"
+                                        title="${user.admin_access ? t('admin.users.remove_admin_access_title') : t('admin.users.grant_admin_access_title')}"
+                                        aria-label="${user.admin_access ? t('admin.users.remove_admin_access_title') : t('admin.users.grant_admin_access_title')}"
+                                        class="ml-1 ${user.admin_access ? 'text-cenat-green' : 'text-gray-400 dark:text-slate-500'} ${isMe ? 'opacity-30 cursor-not-allowed' : 'hover:opacity-80'} transition"
+                                        ${isMe ? 'disabled' : ''}>
+                                        <i class="fas fa-user-shield"></i>
+                                    </button>
+                                ` : ''}
+                            </td>
+                            <td class="py-3 px-4">
+                                <span class="badge ${isActive ? 'badge-active' : 'badge-inactive'}">
+                                    ${isActive ? t('admin.status_active') : t('admin.status_inactive')}
+                                </span>
+                            </td>
+                            <td class="py-3 px-4 text-gray-500 dark:text-slate-400">${formatDate(user.created_at)}</td>
+                            <td class="py-3 px-4 text-gray-500 dark:text-slate-400">${user.last_login ? formatDate(user.last_login) : t('admin.users.never_logged_in')}</td>
+                            <td class="py-3 px-4 text-right">
+                                <button
+                                    onclick="toggleUserActive(${user.id})"
+                                    title="${isActive ? t('admin.users.deactivate_user_title') : t('admin.users.activate_user_title')}"
+                                    aria-label="${isActive ? t('admin.users.deactivate_user_title') : t('admin.users.activate_user_title')}"
+                                    class="${isMe ? 'opacity-30 cursor-not-allowed' : 'hover:opacity-80'} transition"
+                                    ${isMe ? 'disabled' : ''}>
+                                    <i class="fas ${isActive ? 'fa-user-slash text-yellow-500' : 'fa-user-check text-green-500'} text-lg"></i>
+                                </button>
+                            </td>
+                        </tr>`;
+                    }).join('')}
+                </tbody>
+            </table>
+        </div>`;
+
+    const { totalPages = 1, total = users.length } = pagination || {};
+    paginationContainer.innerHTML = renderPagination(page, totalPages, total, USERS_PER_PAGE, 'goToUserPage');
+}
+
+window.goToUserPage = function(page) {
+    loadAdminUsers(page);
+};
+
+async function toggleUserActive(userId) {
+    try {
+        const response = await usersAPI.toggleActive(userId);
+        const newState = response.data.is_active;
+
+        // Actualizar en la página actual sin volver a pedirla al servidor
+        const user = currentPageUsers.find(u => u.id === userId);
+        if (user) user.is_active = newState;
+
+        showToast(response.message, newState ? 'success' : 'warning');
+        renderUsersTable(currentPageUsers, currentUserPage, getCurrentUser().id, currentUsersPagination);
+    } catch (error) {
+        showToast(error.message || t('admin.users.toggle_active_failed'), 'error');
+    }
+}
+
+async function changeUserRole(userId, newRole) {
+    // El backend exige name/email/role juntos en el PUT — se toman del
+    // usuario ya cargado en la página actual, sin una consulta extra a
+    // usersAPI.getById (esos mismos datos ya están en currentPageUsers,
+    // usados para dibujar la fila).
+    const user = currentPageUsers.find(u => u.id === userId);
+    if (!user) return;
+
+    try {
+        await usersAPI.update(userId, { name: user.name, email: user.email, role: newRole });
+        user.role = newRole;
+        // El backend apaga admin_access al mismo tiempo que cambia el rol
+        // si el nuevo rol ya no es 'teacher' (ver User.update) — se refleja
+        // acá mismo para que el ícono de doble rol no quede mostrando un
+        // estado que el servidor ya descartó.
+        if (newRole !== 'teacher') user.admin_access = false;
+        showToast(t('admin.users.role_updated'), 'success');
+        // Re-renderiza para que el color del badge del <select> refleje el
+        // nuevo rol — si no, quedaba con el color del rol anterior hasta
+        // la próxima carga completa de la tabla.
+        renderUsersTable(currentPageUsers, currentUserPage, getCurrentUser().id, currentUsersPagination);
+    } catch (error) {
+        showToast(error.message || t('admin.users.update_role_failed'), 'error');
+        loadAdminUsers(currentUserPage);
+    }
+}
+
+async function toggleUserAdminAccess(userId) {
+    const user = currentPageUsers.find(u => u.id === userId);
+    if (!user) return;
+
+    try {
+        const response = await usersAPI.setAdminAccess(userId, !user.admin_access);
+        user.admin_access = response.data.admin_access;
+        showToast(response.message, 'success');
+        renderUsersTable(currentPageUsers, currentUserPage, getCurrentUser().id, currentUsersPagination);
+    } catch (error) {
+        showToast(error.message || t('admin.users.update_admin_access_failed'), 'error');
+        loadAdminUsers(currentUserPage);
+    }
+}
+
+window.toggleUserActive = toggleUserActive;
+window.changeUserRole = changeUserRole;
+window.toggleUserAdminAccess = toggleUserAdminAccess;

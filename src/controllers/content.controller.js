@@ -1,0 +1,936 @@
+import Content from '../models/Content.js';
+import Course from '../models/Course.js';
+import TaskSubmission from '../models/TaskSubmission.js';
+import ContentQuestion from '../models/ContentQuestion.js';
+import { deleteFile } from '../middlewares/upload.middleware.js';
+import { UPLOADS_ROOT } from '../config/uploads.js';
+import { t } from '../utils/i18n.js';
+import { hasAdminAccess } from '../utils/permissions.js';
+import fs from 'fs';
+import path from 'path';
+
+// Solo http(s) — rechaza esquemas como javascript:, data:, etc.
+const URL_REGEX = /^https?:\/\/.+/i;
+
+/**
+ * Ruta pública (bajo /uploads) donde queda un archivo recién subido, según
+ * el tipo de contenido al que pertenece. Se usa tanto para armar la nueva
+ * `url` del contenido como para poder borrar ese mismo archivo si el
+ * UPDATE que lo iba a referenciar no llega a confirmarse.
+ */
+function uploadedFileUrl(contentType, filename) {
+  if (contentType === 'video') return `/uploads/videos/${filename}`;
+  if (contentType === 'image') return `/uploads/content-images/${filename}`;
+  return `/uploads/files/${filename}`;
+}
+
+/**
+ * Valida un folder_id opcional recibido del body: vacío/null/undefined
+ * significa "sin carpeta" (nivel superior). Si viene, la carpeta debe
+ * existir, ser type='folder', y pertenecer al MISMO curso — así no se
+ * puede colgar contenido de la carpeta de otro curso, ni meterlo "dentro"
+ * de un contenido que no sea una carpeta.
+ */
+/**
+ * Mensaje de por qué un tipo de contenido no se puede marcar
+ * completado/pendiente manualmente, o null si sí se puede. Una tarea/
+ * cuestionario/encuesta se marca automáticamente al entregar/responder; un
+ * foro, una carpeta, y una imagen no tienen un estado "completado" real
+ * (discusión abierta / agrupador / decoración); un texto es material de
+ * lectura opcional, no una actividad que deba exigirse para avanzar — así
+ * que tampoco cuenta para el progreso del curso (ver Content._computeProgress).
+ */
+function uncompletableReason(type, locale) {
+  if (type === 'task') return t(locale, 'errors.task_progress_auto');
+  if (type === 'quiz' || type === 'survey') return t(locale, 'errors.quiz_progress_auto');
+  if (type === 'forum') return t(locale, 'errors.forum_progress_auto');
+  if (type === 'folder') return t(locale, 'errors.folder_no_progress');
+  if (type === 'image') return t(locale, 'errors.image_no_progress');
+  if (type === 'text') return t(locale, 'errors.text_no_progress');
+  return null;
+}
+
+/**
+ * Valida el % del curso que vale una tarea/cuestionario (weight_percent),
+ * recibido como string desde el form-data. Vacío/undefined/null = "no
+ * cuenta para la nota del curso" (null en BD), no un error — asignarle un
+ * peso es opcional, no todo contenido tiene por qué calificar.
+ */
+function parseWeightPercent(input, locale) {
+  if (input === undefined || input === null || input === '') {
+    return { ok: true, value: null };
+  }
+  const value = Number(input);
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    return { ok: false, message: t(locale, 'errors.weight_percent_invalid') };
+  }
+  return { ok: true, value };
+}
+
+async function resolveFolderId(folderIdInput, courseId) {
+  if (folderIdInput === undefined || folderIdInput === null || folderIdInput === '') {
+    return { ok: true, folderId: null };
+  }
+  const folder = await Content.findById(folderIdInput);
+  if (!folder || folder.type !== 'folder' || String(folder.course_id) !== String(courseId)) {
+    return { ok: false };
+  }
+  return { ok: true, folderId: folder.id };
+}
+
+/**
+ * Obtener todos los contenidos de un curso
+ * Si hay sesión activa, incluye el estado "completed" de cada contenido
+ */
+export const getContentsByCourse = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+
+    // canAccessMedia se resuelve UNA sola vez y se reusa para las dos
+    // decisiones de abajo (ocultar el curso inactivo, y redactar el
+    // contenido) — antes se llamaba dos veces: una para el gate de curso
+    // inactivo y otra para la redacción, repitiendo la misma consulta
+    // (isUserEnrolled + isUserTeacher) en la única rama donde el gate de
+    // arriba la necesitaba (un curso inactivo con acceso real).
+    const [course, canAccessMedia] = await Promise.all([
+      Course.findById(courseId),
+      Course.canAccessMedia(courseId, req.session?.user)
+    ]);
+
+    // Mismo criterio que GET /api/courses/:id: un curso desactivado no
+    // debe ser navegable por quien no tenía ya un motivo real para verlo
+    // (ver el comentario completo en course.controller.js#getCourseById).
+    const courseIsInactive = course && (course.is_active == 0 || course.is_active === false);
+    if (courseIsInactive && !canAccessMedia) {
+      return res.status(404).json({
+        success: false,
+        message: t(req.locale, 'errors.course_not_found')
+      });
+    }
+
+    const contents = req.session?.user
+      ? await Content.findByCourseWithProgress(courseId, req.session.user.id)
+      : await Content.findByCourse(courseId);
+
+    // Solo un admin, un estudiante inscrito, o el profesor asignado al
+    // curso recibe las URLs/texto reales de video/archivo/texto.
+    // Cualquier otro usuario ve el listado (títulos, orden) pero sin
+    // acceso directo al contenido — así se fuerza la inscripción antes
+    // de poder reproducir, descargar, o leer una lección de texto.
+    const responseData = canAccessMedia
+      ? contents
+      : contents.map(Content.redactForNoAccess);
+
+    res.json({
+      success: true,
+      data: responseData
+    });
+  } catch (error) {
+    console.error('Error al obtener contenidos:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.get_contents_failed')
+    });
+  }
+};
+
+/**
+ * Obtener un contenido por ID
+ */
+export const getContentById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const content = await Content.findById(id);
+
+    if (!content) {
+      return res.status(404).json({
+        success: false,
+        message: t(req.locale, 'errors.content_not_found')
+      });
+    }
+
+    // Mismo criterio que en los demás endpoints de contenido: solo admin,
+    // inscrito, o profesor asignado ve la URL/texto real. Antes este
+    // endpoint público devolvía la URL sin ningún filtro.
+    const canAccessMedia = await Course.canAccessMedia(content.course_id, req.session?.user);
+
+    const responseData = canAccessMedia ? content : Content.redactForNoAccess(content);
+
+    res.json({
+      success: true,
+      data: responseData
+    });
+  } catch (error) {
+    console.error('Error al obtener contenido:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.get_content_failed')
+    });
+  }
+};
+
+/**
+ * Compartida por createVideoContent/createFileContent/createImageContent —
+ * mismo flujo (archivo obligatorio, folder_id opcional validado, limpieza
+ * del archivo recién subido en cualquier salida de error) para los 3 tipos
+ * de contenido que solo difieren en la subcarpeta de uploads (resuelta acá
+ * vía la misma uploadedFileUrl que ya usa el UPDATE) y en los mensajes.
+ */
+async function createFileBasedContent(req, res, { type, fileRequiredErrorKey, addedMessageKey, addFailedErrorKey, errorLogLabel }) {
+  try {
+    const { course_id, title, description, title_en, description_en, folder_id } = req.body;
+
+    if (!course_id || !title) {
+      // multer ya escribió el archivo en disco antes de llegar acá —
+      // sin esto, un título vacío junto con un archivo real subido dejaba
+      // el archivo huérfano (los demás checks de este método sí limpian).
+      if (req.file) await deleteFile(uploadedFileUrl(type, req.file.filename));
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.course_id_title_required')
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, fileRequiredErrorKey)
+      });
+    }
+
+    const folderCheck = await resolveFolderId(folder_id, course_id);
+    if (!folderCheck.ok) {
+      await deleteFile(uploadedFileUrl(type, req.file.filename));
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.folder_not_in_course') });
+    }
+
+    const url = uploadedFileUrl(type, req.file.filename);
+    const file_size = req.file.size;
+
+    const contentId = await Content.create({
+      course_id,
+      type,
+      title,
+      description,
+      title_en,
+      description_en,
+      url,
+      file_size,
+      folder_id: folderCheck.folderId
+    });
+
+    res.status(201).json({
+      success: true,
+      message: t(req.locale, addedMessageKey),
+      data: { id: contentId }
+    });
+  } catch (error) {
+    console.error(errorLogLabel, error);
+    // Si hubo error, eliminar el archivo subido
+    if (req.file) {
+      await deleteFile(uploadedFileUrl(type, req.file.filename));
+    }
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, addFailedErrorKey)
+    });
+  }
+}
+
+/**
+ * Crear nuevo contenido de tipo VIDEO (solo admin)
+ */
+export const createVideoContent = (req, res) => createFileBasedContent(req, res, {
+  type: 'video',
+  fileRequiredErrorKey: 'errors.video_file_required',
+  addedMessageKey: 'success.video_added',
+  addFailedErrorKey: 'errors.add_video_failed',
+  errorLogLabel: 'Error al crear contenido de video:'
+});
+
+/**
+ * Crear nuevo contenido de tipo FILE (solo admin)
+ */
+export const createFileContent = (req, res) => createFileBasedContent(req, res, {
+  type: 'file',
+  fileRequiredErrorKey: 'errors.file_required',
+  addedMessageKey: 'success.file_added',
+  addFailedErrorKey: 'errors.add_file_failed',
+  errorLogLabel: 'Error al crear contenido de archivo:'
+});
+
+/**
+ * Crear nuevo contenido de tipo IMAGE: una imagen más en la lista de
+ * contenido del curso (no una portada), para decorar/ilustrar. Mismo
+ * patrón que video/file: archivo obligatorio.
+ */
+export const createImageContent = (req, res) => createFileBasedContent(req, res, {
+  type: 'image',
+  fileRequiredErrorKey: 'errors.image_required',
+  addedMessageKey: 'success.image_added',
+  addFailedErrorKey: 'errors.add_image_failed',
+  errorLogLabel: 'Error al crear contenido de imagen:'
+});
+
+/**
+ * Crear nuevo contenido de tipo TEXT: sin archivo, el contenido en sí es
+ * el texto guardado en `description`.
+ */
+export const createTextContent = async (req, res) => {
+  try {
+    const { course_id, title, description, title_en, description_en, folder_id } = req.body;
+
+    if (!course_id || !title) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.course_id_title_required')
+      });
+    }
+
+    if (!description || !String(description).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.text_content_required')
+      });
+    }
+
+    const folderCheck = await resolveFolderId(folder_id, course_id);
+    if (!folderCheck.ok) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.folder_not_in_course') });
+    }
+
+    const contentId = await Content.create({
+      course_id,
+      type: 'text',
+      title,
+      description,
+      title_en,
+      description_en,
+      url: null,
+      folder_id: folderCheck.folderId
+    });
+
+    res.status(201).json({
+      success: true,
+      message: t(req.locale, 'success.text_content_added'),
+      data: { id: contentId }
+    });
+  } catch (error) {
+    console.error('Error al crear contenido de texto:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.add_text_content_failed')
+    });
+  }
+};
+
+/**
+ * Crear nuevo contenido de tipo URL: un video externo (ej. YouTube) en
+ * vez de un archivo subido — la URL se guarda directo, sin multer.
+ */
+export const createUrlContent = async (req, res) => {
+  try {
+    const { course_id, title, description, title_en, description_en, url, folder_id } = req.body;
+
+    if (!course_id || !title) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.course_id_title_required')
+      });
+    }
+
+    if (!url || !URL_REGEX.test(String(url).trim())) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.invalid_url_format')
+      });
+    }
+
+    const folderCheck = await resolveFolderId(folder_id, course_id);
+    if (!folderCheck.ok) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.folder_not_in_course') });
+    }
+
+    const contentId = await Content.create({
+      course_id,
+      type: 'url',
+      title,
+      description,
+      title_en,
+      description_en,
+      url: String(url).trim(),
+      folder_id: folderCheck.folderId
+    });
+
+    res.status(201).json({
+      success: true,
+      message: t(req.locale, 'success.url_content_added'),
+      data: { id: contentId }
+    });
+  } catch (error) {
+    console.error('Error al crear contenido de URL:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.add_url_content_failed')
+    });
+  }
+};
+
+/**
+ * Crear nuevo contenido de tipo TASK (tarea): el archivo de
+ * instrucciones/plantilla es OPCIONAL (a diferencia de video/archivo,
+ * donde es obligatorio) — una tarea puede ser solo texto de
+ * instrucciones sin ningún archivo adjunto.
+ */
+export const createTaskContent = async (req, res) => {
+  try {
+    const { course_id, title, description, title_en, description_en, folder_id, weight_percent } = req.body;
+
+    if (!course_id || !title) {
+      // El archivo de instrucciones es opcional, pero si vino, multer ya
+      // lo escribió en disco antes de llegar acá — ver nota equivalente en
+      // createVideoContent.
+      if (req.file) await deleteFile(`/uploads/files/${req.file.filename}`);
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.course_id_title_required')
+      });
+    }
+
+    const weightCheck = parseWeightPercent(weight_percent, req.locale);
+    if (!weightCheck.ok) {
+      if (req.file) await deleteFile(`/uploads/files/${req.file.filename}`);
+      return res.status(400).json({ success: false, message: weightCheck.message });
+    }
+
+    const folderCheck = await resolveFolderId(folder_id, course_id);
+    if (!folderCheck.ok) {
+      if (req.file) await deleteFile(`/uploads/files/${req.file.filename}`);
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.folder_not_in_course') });
+    }
+
+    let url = null;
+    let file_size = null;
+    if (req.file) {
+      url = `/uploads/files/${req.file.filename}`;
+      file_size = req.file.size;
+    }
+
+    const contentId = await Content.create({
+      course_id,
+      type: 'task',
+      title,
+      description,
+      title_en,
+      description_en,
+      url,
+      file_size,
+      folder_id: folderCheck.folderId,
+      weight_percent: weightCheck.value
+    });
+
+    res.status(201).json({
+      success: true,
+      message: t(req.locale, 'success.task_added'),
+      data: { id: contentId }
+    });
+  } catch (error) {
+    console.error('Error al crear la tarea:', error);
+    if (req.file) {
+      await deleteFile(`/uploads/files/${req.file.filename}`);
+    }
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.add_task_failed')
+    });
+  }
+};
+
+/**
+ * Crear nuevo tema de foro: el profesor/admin escribe el post principal
+ * (guardado en `description`, igual que en 'text') y los estudiantes
+ * inscritos responden después vía forum.controller.js — este endpoint solo
+ * crea el tema, no acepta respuestas.
+ */
+export const createForumContent = async (req, res) => {
+  try {
+    const { course_id, title, description, title_en, description_en, folder_id } = req.body;
+
+    if (!course_id || !title) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.course_id_title_required')
+      });
+    }
+
+    if (!description || !String(description).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.forum_topic_body_required')
+      });
+    }
+
+    const folderCheck = await resolveFolderId(folder_id, course_id);
+    if (!folderCheck.ok) {
+      return res.status(400).json({ success: false, message: t(req.locale, 'errors.folder_not_in_course') });
+    }
+
+    const contentId = await Content.create({
+      course_id,
+      type: 'forum',
+      title,
+      description,
+      title_en,
+      description_en,
+      url: null,
+      folder_id: folderCheck.folderId
+    });
+
+    res.status(201).json({
+      success: true,
+      message: t(req.locale, 'success.forum_topic_created'),
+      data: { id: contentId }
+    });
+  } catch (error) {
+    console.error('Error al crear el tema de foro:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.create_forum_topic_failed')
+    });
+  }
+};
+
+/**
+ * Crear una carpeta: solo agrupa otro contenido del mismo curso (video,
+ * archivo, texto, URL, tarea o foro) bajo su folder_id — no lleva url ni
+ * texto propio. Una carpeta nunca puede tener folder_id (no hay
+ * subcarpetas, un solo nivel de anidamiento).
+ */
+export const createFolderContent = async (req, res) => {
+  try {
+    const { course_id, title, title_en } = req.body;
+
+    if (!course_id || !title) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.course_id_title_required')
+      });
+    }
+
+    const contentId = await Content.create({
+      course_id,
+      type: 'folder',
+      title,
+      description: null,
+      title_en,
+      description_en: null,
+      url: null,
+      folder_id: null
+    });
+
+    res.status(201).json({
+      success: true,
+      message: t(req.locale, 'success.folder_created'),
+      data: { id: contentId }
+    });
+  } catch (error) {
+    console.error('Error al crear la carpeta:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.create_folder_failed')
+    });
+  }
+};
+
+/**
+ * Actualizar contenido (solo admin)
+ */
+export const updateContent = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, description, title_en, description_en, order_index, url, folder_id, weight_percent } = req.body;
+
+    const content = await Content.findById(id);
+    if (!content) {
+      return res.status(404).json({
+        success: false,
+        message: t(req.locale, 'errors.content_not_found')
+      });
+    }
+
+    const updateData = {};
+    if (title !== undefined) updateData.title = title;
+    if (description !== undefined) updateData.description = description;
+    if (title_en !== undefined) updateData.title_en = title_en;
+    if (description_en !== undefined) updateData.description_en = description_en;
+    if (order_index !== undefined) updateData.order_index = parseInt(order_index);
+
+    // Solo una tarea (o un cuestionario/encuesta, ver quiz.controller.js)
+    // tiene sentido calificarla como % del curso — el resto de tipos ni
+    // siquiera muestra este campo en el formulario, pero se revalida acá
+    // por si acaso.
+    // Estos 4 `return` tempranos pueden dispararse con un archivo de
+    // reemplazo YA escrito en disco (multer corrió antes que este
+    // handler) — sin limpiarlo acá, quedaba huérfano (el resto del método
+    // sí lo hace, ver el UPDATE de más abajo y el catch general).
+    if (weight_percent !== undefined) {
+      // 'survey' queda afuera a propósito: una encuesta nunca se califica
+      // (mismo criterio que ya fuerza quiz.controller.js al crearla) — por
+      // esta ruta genérica sí se le podía colar un weight_percent que
+      // getCourseGradeBreakdown ignora en silencio (solo mira type='quiz').
+      if (!['task', 'quiz'].includes(content.type)) {
+        if (req.file) await deleteFile(uploadedFileUrl(content.type, req.file.filename));
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.weight_percent_task_quiz_only')
+        });
+      }
+      const weightCheck = parseWeightPercent(weight_percent, req.locale);
+      if (!weightCheck.ok) {
+        if (req.file) await deleteFile(uploadedFileUrl(content.type, req.file.filename));
+        return res.status(400).json({ success: false, message: weightCheck.message });
+      }
+      updateData.weight_percent = weightCheck.value;
+    }
+
+    // Mover el contenido a otra carpeta (o sacarlo con folder_id: null).
+    // Una carpeta no puede meterse dentro de otra (un solo nivel).
+    if (folder_id !== undefined) {
+      if (content.type === 'folder') {
+        if (req.file) await deleteFile(uploadedFileUrl(content.type, req.file.filename));
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.folder_cannot_nest')
+        });
+      }
+      const folderCheck = await resolveFolderId(folder_id, content.course_id);
+      if (!folderCheck.ok) {
+        if (req.file) await deleteFile(uploadedFileUrl(content.type, req.file.filename));
+        return res.status(400).json({ success: false, message: t(req.locale, 'errors.folder_not_in_course') });
+      }
+      updateData.folder_id = folderCheck.folderId;
+    }
+
+    // Contenido tipo URL no lleva archivo: la única forma de "reemplazar"
+    // el contenido es cambiar el link.
+    if (content.type === 'url' && url !== undefined) {
+      if (!URL_REGEX.test(String(url).trim())) {
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.invalid_url_format')
+        });
+      }
+      updateData.url = String(url).trim();
+    }
+
+    // Si se subió un nuevo archivo, actualizar la URL según el tipo. El
+    // archivo anterior (guardado antes de tocar updateData) se borra recién
+    // después de confirmar el UPDATE en BD — si se borrara antes y el
+    // UPDATE fallara (o no afectara ninguna fila), la BD quedaría apuntando
+    // a un archivo que ya no existe en disco. Mismo bug que ya se había
+    // arreglado para la miniatura del curso (ver Course.updateCourse),
+    // pero nunca se replicó acá.
+    const previousUrl = req.file ? content.url : null;
+    const newFileUrl = req.file ? uploadedFileUrl(content.type, req.file.filename) : null;
+    if (newFileUrl) {
+      updateData.url = newFileUrl;
+    }
+
+    const updated = await Content.update(id, updateData);
+
+    if (!updated) {
+      // El UPDATE no afectó ninguna fila (ej. el contenido se borró en la
+      // ventana entre el findById de arriba y este update). El archivo de
+      // reemplazo ya se escribió a disco (multer corrió antes que este
+      // handler) pero nada llegó a referenciarlo — se borra para no
+      // dejarlo huérfano.
+      if (newFileUrl) await deleteFile(newFileUrl);
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.content_update_no_rows')
+      });
+    }
+
+    if (previousUrl) {
+      await deleteFile(previousUrl);
+    }
+
+    res.json({
+      success: true,
+      message: t(req.locale, 'success.content_updated')
+    });
+  } catch (error) {
+    console.error('Error al actualizar contenido:', error);
+    if (req.file) {
+      // Mismo criterio: el archivo ya está en disco pero el UPDATE nunca
+      // llegó a confirmarse (o ni se intentó, si el error fue antes). req.contentType
+      // lo fija la ruta antes de llegar acá (ver content.routes.js).
+      await deleteFile(uploadedFileUrl(req.contentType, req.file.filename));
+    }
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.update_content_failed')
+    });
+  }
+};
+
+/**
+ * Eliminar contenido (solo admin)
+ */
+export const deleteContent = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const content = await Content.findById(id);
+    if (!content) {
+      return res.status(404).json({
+        success: false,
+        message: t(req.locale, 'errors.content_not_found')
+      });
+    }
+
+    // Una carpeta con contenido adentro no se borra de un tirón (evita
+    // perder por accidente tareas con entregas, u otro contenido, que
+    // estaban agrupados ahí) — hay que vaciarla o mover su contenido antes.
+    if (content.type === 'folder') {
+      const hasChildren = await Content.hasChildren(id);
+      if (hasChildren) {
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.folder_not_empty')
+        });
+      }
+    }
+
+    // Recolectar las rutas de archivo (el propio contenido, y si es una
+    // tarea, el archivo de cada entrega) ANTES de borrar nada — la fila en
+    // task_submissions se borra sola en cascada (FK ON DELETE CASCADE) al
+    // borrar el contenido, así que hay que leerla mientras todavía existe.
+    // Los archivos en disco recién se borran después de confirmar el
+    // DELETE en BD: si se borraran antes y el DELETE fallara, la BD
+    // quedaría apuntando a archivos que ya no existen (type='url' no tiene
+    // archivo local, es un link externo — no hay nada que borrar del disco).
+    // Riesgo residual aceptado, documentado a propósito: entre este
+    // findAllByContent y el DELETE de abajo hay una ventana angosta donde,
+    // si un estudiante entrega justo esta tarea, su fila se borra en
+    // cascada por la FK (task_submissions.content_id) sin que el archivo
+    // de esa entrega entre en filesToDelete, quedando huérfano en disco.
+    // Cerrarla del todo exigiría coordinar un lock con el INSERT de
+    // submitTask (submission.controller.js), que hoy no comparte ninguna
+    // transacción con este método — impacto bajo (ventana de milisegundos,
+    // requiere que ambas acciones coincidan casi exactamente), así que se
+    // deja así en vez de agregar esa complejidad para un caso tan puntual.
+    const filesToDelete = [];
+    if (content.url && content.type !== 'url') filesToDelete.push(content.url);
+    if (content.type === 'task') {
+      const submissions = await TaskSubmission.findAllByContent(id);
+      submissions.forEach(submission => filesToDelete.push(submission.file_url));
+    }
+    // Las preguntas de un quiz/survey se borran en cascada (ON DELETE
+    // CASCADE desde contents), pero eso solo borra las FILAS — un adjunto
+    // propio (imagen/video, ver quiz.controller.js) queda huérfano en disco
+    // si no se recolecta acá antes de borrar. 'url' no tiene archivo local.
+    if (['quiz', 'survey'].includes(content.type)) {
+      const questions = await ContentQuestion.findByContent(id);
+      questions.forEach((q) => {
+        if (q.attachment_url && q.attachment_type !== 'url') filesToDelete.push(q.attachment_url);
+      });
+    }
+
+    const deleted = await Content.delete(id);
+
+    if (deleted) {
+      await Promise.all(filesToDelete.map(deleteFile));
+      res.json({
+        success: true,
+        message: t(req.locale, 'success.content_deleted')
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.content_delete_no_rows')
+      });
+    }
+  } catch (error) {
+    console.error('Error al eliminar contenido:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.delete_content_failed')
+    });
+  }
+};
+
+/**
+ * Reordenar contenidos de un curso (solo admin)
+ */
+export const reorderContents = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    const { contentIds } = req.body;
+
+    if (!Array.isArray(contentIds) || contentIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.content_ids_array_required')
+      });
+    }
+
+    await Content.reorder(courseId, contentIds);
+
+    res.json({
+      success: true,
+      message: t(req.locale, 'success.contents_reordered')
+    });
+  } catch (error) {
+    console.error('Error al reordenar contenidos:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.reorder_contents_failed')
+    });
+  }
+};
+
+/**
+ * Descargar archivo
+ */
+export const downloadFile = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const content = await Content.findById(id);
+    
+    if (!content) {
+      return res.status(404).json({
+        success: false,
+        message: t(req.locale, 'errors.content_not_found')
+      });
+    }
+
+    // El archivo de instrucciones de una tarea se guarda igual que un
+    // 'file' (mismo storage, misma carpeta no-estática), así que también
+    // se descarga por acá.
+    const isDownloadable = content.type === 'file' || (content.type === 'task' && content.url);
+    if (!isDownloadable) {
+      return res.status(400).json({
+        success: false,
+        message: t(req.locale, 'errors.not_downloadable_content')
+      });
+    }
+
+    // Solo puede descargar: un admin, un estudiante inscrito, o el
+    // profesor asignado al curso al que pertenece este contenido. Antes
+    // cualquier usuario autenticado podía descargar cualquier archivo sin
+    // importar su inscripción.
+    const canAccess = await Course.canAccessMedia(content.course_id, req.session.user);
+    if (!canAccess) {
+      return res.status(403).json({
+        success: false,
+        message: t(req.locale, 'errors.download_access_required')
+      });
+    }
+
+    const filePath = path.join(UPLOADS_ROOT, content.url.replace(/^\/?uploads\//, ''));
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        success: false,
+        message: t(req.locale, 'errors.file_not_found_server')
+      });
+    }
+
+    // Obtener nombre original del archivo
+    const fileName = path.basename(content.url);
+
+    res.download(filePath, fileName);
+  } catch (error) {
+    console.error('Error al descargar archivo:', error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, 'errors.download_file_failed')
+    });
+  }
+};
+
+// =================================
+// Progreso de contenidos
+// =================================
+
+/**
+ * Compartido por markContentCompleted/markContentIncomplete — mismo guard
+ * de tipo bloqueado, mismo guard de inscripción/admin y mismo recálculo de
+ * progreso; solo cambian qué método de Content se llama y los mensajes.
+ */
+async function setContentProgress(req, res, completed, messages) {
+  try {
+    const { id } = req.params;
+    const userId = req.session.user.id;
+
+    const content = await Content.findById(id);
+    if (!content) {
+      return res.status(404).json({
+        success: false,
+        message: t(req.locale, 'errors.content_not_found')
+      });
+    }
+
+    const blockedReason = uncompletableReason(content.type, req.locale);
+    if (blockedReason) {
+      return res.status(400).json({ success: false, message: blockedReason });
+    }
+
+    // Solo se puede marcar progreso en contenido de un curso en el que
+    // se está inscrito (o si es admin). Antes cualquier usuario autenticado
+    // podía marcar como completado contenido de cursos ajenos.
+    const isAdminUser = hasAdminAccess(req.session.user);
+    if (!isAdminUser) {
+      const enrolled = await Course.isUserEnrolled(content.course_id, userId);
+      if (!enrolled) {
+        return res.status(403).json({
+          success: false,
+          message: t(req.locale, messages.accessErrorKey)
+        });
+      }
+    }
+
+    if (completed) {
+      await Content.markCompleted(id, userId);
+    } else {
+      await Content.markIncomplete(id, userId);
+    }
+    const { progress: newProgress, total: totalContents, completed: completedContents } = await Content.recalculateCourseProgress(content.course_id, userId);
+
+    res.json({
+      success: true,
+      message: t(req.locale, messages.successKey),
+      data: { progress: newProgress, total: totalContents, completed: completedContents }
+    });
+  } catch (error) {
+    console.error(messages.errorLogLabel, error);
+    res.status(500).json({
+      success: false,
+      message: t(req.locale, messages.failedErrorKey)
+    });
+  }
+}
+
+/**
+ * Marcar un contenido como completado por el usuario actual.
+ * Recalcula automáticamente el progreso general del curso.
+ */
+export const markContentCompleted = (req, res) => setContentProgress(req, res, true, {
+  accessErrorKey: 'errors.mark_completed_access_required',
+  successKey: 'success.content_marked_completed',
+  failedErrorKey: 'errors.mark_completed_failed',
+  errorLogLabel: 'Error al marcar contenido como completado:'
+});
+
+/**
+ * Desmarcar un contenido como completado (volver a pendiente).
+ * Recalcula automáticamente el progreso general del curso.
+ */
+export const markContentIncomplete = (req, res) => setContentProgress(req, res, false, {
+  accessErrorKey: 'errors.mark_incomplete_access_required',
+  successKey: 'success.content_unmarked',
+  failedErrorKey: 'errors.mark_incomplete_failed',
+  errorLogLabel: 'Error al desmarcar contenido:'
+});

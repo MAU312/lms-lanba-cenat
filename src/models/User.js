@@ -1,0 +1,232 @@
+import pool from '../config/db.js';
+import { escapeLike } from '../utils/sql.js';
+
+class User {
+  /**
+   * Lista paginada de usuarios, con búsqueda opcional por nombre/email.
+   * Devuelve también el total que cumple el filtro (sin paginar).
+   *
+   * `id DESC` como desempate del ORDER BY es imprescindible, no cosmético:
+   * `created_at` tiene precisión de segundos y un import CSV crea decenas
+   * de usuarios en el mismo segundo. Sin un orden total, MySQL no garantiza
+   * el mismo orden entre dos páginas (LIMIT/OFFSET) para filas empatadas —
+   * medido con 250 usuarios empatados entre 2.969: 77 aparecían en dos
+   * páginas y 77 no aparecían en ninguna.
+   */
+  static async findAll({ page = 1, limit = 10, search = '' } = {}) {
+    const offset = (page - 1) * limit;
+    const where = search ? 'WHERE name LIKE ? OR email LIKE ?' : '';
+    const pattern = `%${escapeLike(search)}%`;
+    const searchParams = search ? [pattern, pattern] : [];
+
+    const [rows] = await pool.query(
+      `SELECT id, name, username, email, role, admin_access, is_active, created_at, last_login FROM users ${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [...searchParams, limit, offset]
+    );
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) as total FROM users ${where}`,
+      searchParams
+    );
+
+    return { rows, total: countRows[0].total };
+  }
+
+  /**
+   * Lista simple (sin paginar) de usuarios activos con un rol dado —
+   * usado para poblar el selector de profesores al crear/editar un curso.
+   */
+  static async findByRole(role) {
+    const [rows] = await pool.query(
+      'SELECT id, name, email FROM users WHERE role = ? AND is_active = TRUE ORDER BY name ASC',
+      [role]
+    );
+    return rows;
+  }
+
+  static async findById(id) {
+    const [rows] = await pool.query(
+      'SELECT id, name, username, email, role, admin_access, avatar_url, is_active, created_at, last_login FROM users WHERE id = ?',
+      [id]
+    );
+    return rows[0];
+  }
+
+  static async findByEmail(email) {
+    const [rows] = await pool.query(
+      'SELECT * FROM users WHERE email = ?',
+      [email]
+    );
+    return rows[0];
+  }
+
+  /**
+   * Busca por email O por username en una sola consulta — permite que el
+   * login acepte cualquiera de los dos en el mismo campo.
+   */
+  static async findByEmailOrUsername(identifier) {
+    const [rows] = await pool.query(
+      'SELECT * FROM users WHERE email = ? OR username = ?',
+      [identifier, identifier]
+    );
+    return rows[0];
+  }
+
+  static async create({ name, username, email, password, role = 'student' }) {
+    const [result] = await pool.query(
+      'INSERT INTO users (name, username, email, password, role) VALUES (?, ?, ?, ?, ?)',
+      [name, username || null, email, password, role]
+    );
+    return result.insertId;
+  }
+
+  /**
+   * `admin_access` (doble rol profesor+admin) solo tiene sentido para un
+   * profesor — si el rol cambia a otra cosa acá mismo, se apaga en la
+   * misma consulta para no dejar el flag "huérfano" en un student/admin.
+   */
+  static async update(id, { name, email, role }) {
+    const [result] = await pool.query(
+      "UPDATE users SET name = ?, email = ?, role = ?, admin_access = CASE WHEN ? = 'teacher' THEN admin_access ELSE FALSE END WHERE id = ?",
+      [name, email, role, role, id]
+    );
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * Da o quita a un profesor el acceso adicional de administrador (doble
+   * rol) — separado de update() porque ese requiere name/email/role juntos
+   * y este toggle es independiente, igual que toggleActive().
+   */
+  static async setAdminAccess(id, adminAccess) {
+    const [result] = await pool.query(
+      "UPDATE users SET admin_access = ? WHERE id = ? AND role = 'teacher'",
+      [adminAccess ? 1 : 0, id]
+    );
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * Foto de perfil del propio usuario (o null para quitarla). Separado de
+   * update() porque este lo llama cualquier usuario sobre sí mismo (ver
+   * PUT/DELETE /api/users/me/avatar), no solo un admin sobre otro usuario.
+   */
+  static async updateAvatar(id, avatarUrl) {
+    const [result] = await pool.query(
+      'UPDATE users SET avatar_url = ? WHERE id = ?',
+      [avatarUrl, id]
+    );
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * Registra el momento del último inicio de sesión exitoso.
+   */
+  static async updateLastLogin(id) {
+    await pool.query('UPDATE users SET last_login = NOW() WHERE id = ?', [id]);
+  }
+
+  /**
+   * Activar o desactivar un usuario
+   */
+  static async toggleActive(id, is_active) {
+    const [result] = await pool.query(
+      'UPDATE users SET is_active = ? WHERE id = ?',
+      [is_active ? 1 : 0, id]
+    );
+    return result.affectedRows > 0;
+  }
+
+  static async delete(id) {
+    const [result] = await pool.query('DELETE FROM users WHERE id = ?', [id]);
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * Cursos en los que un usuario está inscrito, paginado — devuelve
+   * también el total sin paginar para que el cliente pueda calcular el
+   * número de páginas.
+   */
+  static async getEnrolledCourses(userId, { page = 1, limit = 12 } = {}) {
+    const offset = (page - 1) * limit;
+    const [rows] = await pool.query(
+      `SELECT c.*, e.progress, e.enrolled_at
+       FROM courses c
+       INNER JOIN enrollments e ON c.id = e.course_id
+       WHERE e.user_id = ?
+       ORDER BY e.enrolled_at DESC, e.id DESC
+       LIMIT ? OFFSET ?`,
+      [userId, limit, offset]
+    );
+
+    const [countRows] = await pool.query(
+      'SELECT COUNT(*) as total FROM enrollments WHERE user_id = ?',
+      [userId]
+    );
+
+    return { rows, total: countRows[0].total };
+  }
+
+  static async countByRole() {
+    const [rows] = await pool.query(
+      'SELECT role, COUNT(*) as count FROM users GROUP BY role'
+    );
+    return rows;
+  }
+
+  /**
+   * Guarda el hash del token de recuperación de contraseña y su expiración.
+   * Se guarda el hash (no el token crudo) por la misma razón que las
+   * contraseñas: si la base de datos se filtrara, un hash de un token de
+   * un solo uso no sirve para nada sin el valor original.
+   */
+  static async setResetToken(id, tokenHash, expiresAt) {
+    await pool.query(
+      'UPDATE users SET reset_token_hash = ?, reset_token_expires = ? WHERE id = ?',
+      [tokenHash, expiresAt, id]
+    );
+  }
+
+  /**
+   * Busca un usuario por el hash del token, solo si no ha expirado.
+   */
+  static async findByValidResetTokenHash(tokenHash) {
+    const [rows] = await pool.query(
+      'SELECT * FROM users WHERE reset_token_hash = ? AND reset_token_expires > NOW()',
+      [tokenHash]
+    );
+    return rows[0];
+  }
+
+  /**
+   * Actualiza la contraseña y consume el token de recuperación (evita que
+   * el mismo enlace se pueda reutilizar dos veces).
+   */
+  static async resetPassword(id, hashedPassword) {
+    const [result] = await pool.query(
+      'UPDATE users SET password = ?, reset_token_hash = NULL, reset_token_expires = NULL WHERE id = ?',
+      [hashedPassword, id]
+    );
+    return result.affectedRows > 0;
+  }
+
+  /**
+   * Borra todas las sesiones activas de un usuario — se llama justo
+   * después de resetear la contraseña, para que una sesión ya robada (si
+   * esa fue la razón del reset) deje de servir en el acto, en vez de
+   * seguir viva hasta que expire sola (hasta 24h, ver app.js) o alguien
+   * la cierre a mano. Las sesiones de express-mysql-session no tienen una
+   * columna/FK propia hacia `users` — se guardan como JSON crudo en
+   * `data` — así que se filtra con JSON_EXTRACT sobre `user.id`, que ya
+   * queda ahí en cada sesión logueada (ver auth.controller.js login y
+   * auth.middleware.js, que lo re-sincronizan en cada request).
+   */
+  static async invalidateSessions(userId) {
+    await pool.query(
+      "DELETE FROM sessions WHERE JSON_EXTRACT(data, '$.user.id') = ?",
+      [userId]
+    );
+  }
+}
+
+export default User;

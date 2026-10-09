@@ -1,0 +1,2238 @@
+/**
+ * Gestión de contenidos de un curso (videos/archivos) — compartido entre
+ * la vista de edición del admin (views_admin_edit_course.js) y la vista
+ * de edición del profesor sobre su curso asignado (views_teacher_course.js).
+ * La única diferencia entre ambos contextos es qué función hay que llamar
+ * para volver a renderizar la página después de crear/borrar contenido —
+ * cada vista la registra con initCourseContentManager() al montarse.
+ *
+ * Carpetas: un solo nivel (no hay subcarpetas). Cada carpeta muestra su
+ * propio set de las 6 secciones de contenido (Videos/URL/Archivos/Texto/
+ * Tareas/Foro), igual que el contenido "sin carpeta" — para no repetir
+ * ids de DOM cuando hay varias carpetas, cada contenedor/lista se
+ * identifica con scopeId(base, folderId).
+ */
+
+// Mismos límites que sus contrapartes en src/middlewares/upload.middleware.js
+// — chequeados en el cliente (ver checkFileSize en utils.js) antes de
+// subir, para no esperar a que Multer rechace un archivo demasiado grande
+// recién al terminar la subida.
+const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024; // 2GB
+const MAX_DOC_BYTES = 50 * 1024 * 1024; // 50MB (archivo / instrucciones de tarea)
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
+
+let contentManagerRerender = () => {};
+
+/**
+ * `course` es opcional (por compatibilidad con cualquier otro llamador
+ * viejo) — cuando se pasa y el curso no es en sí un curso hijo de un
+ * módulo, dispara la carga async de la lista de módulos (ver
+ * renderCourseModulesSectionHTML/loadCourseModulesList): el HTML de esa
+ * sección ya está en el DOM en este punto (ambas vistas llaman a esto
+ * después de setear app.innerHTML), así que el contenedor #course-modules-list
+ * existe y puede rellenarse.
+ */
+function initCourseContentManager(rerenderFn, course) {
+    contentManagerRerender = rerenderFn;
+    if (course && !course.parent_module_id) {
+        loadCourseModulesList(course.id);
+    }
+    setupExpandableText();
+}
+
+function scopeId(base, folderId) {
+    return `${base}-${folderId || 'root'}`;
+}
+
+function renderCourseContentManagerHTML(course, contents) {
+    const folders = contents.filter(c => c.type === 'folder');
+
+    return `
+        <div class="space-y-6">
+            <!-- Crear carpeta -->
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-bold text-gray-900">
+                        <i class="fas fa-folder text-cenat-green mr-2"></i> ${t('contentManager.folders.heading')}
+                    </h2>
+                    <button onclick="showAddFolderForm(${course.id})" class="text-sm border border-green-200 bg-green-50 text-cenat-green px-3 py-1.5 rounded-lg hover:bg-green-100 transition">
+                        <i class="fas fa-plus mr-1"></i> ${t('contentManager.folders.create')}
+                    </button>
+                </div>
+                <div id="add-folder-form-container"></div>
+                ${folders.length === 0 ? `
+                    <p class="text-gray-500 text-sm text-center py-4">${t('contentManager.folders.empty')}</p>
+                ` : `
+                    <p class="text-gray-400 text-xs">${t('contentManager.folders.hint')}</p>
+                `}
+            </div>
+
+            ${renderCourseModulesSectionHTML(course)}
+
+            ${renderContentTypeSections(course.id, contents, null, false)}
+        </div>
+    `;
+}
+
+// =================================
+// Módulos (cursos anidados dentro de un curso)
+//
+// Distinto de las "carpetas" de arriba: acá cada módulo agrupa CURSOS
+// COMPLETOS (portada/título/profesor propios), no contenido. Nesting de un
+// solo nivel — un curso que ya es hijo de un módulo (course.parent_module_id)
+// no puede alojar sus propios módulos, así que esta sección directamente no
+// se muestra en ese caso (el backend también lo rechaza, ver
+// courseModule.controller.js#createModule — esto es solo la UI).
+// =================================
+
+function renderCourseModulesSectionHTML(course) {
+    if (course.parent_module_id) return '';
+
+    return `
+        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-lg font-bold text-gray-900">
+                    <i class="fas fa-layer-group text-cenat-green mr-2"></i> ${t('contentManager.modules.heading')}
+                </h2>
+                <button onclick="showAddModuleForm(${course.id})" class="text-sm border border-green-200 bg-green-50 text-cenat-green px-3 py-1.5 rounded-lg hover:bg-green-100 transition">
+                    <i class="fas fa-plus mr-1"></i> ${t('contentManager.modules.create')}
+                </button>
+            </div>
+            <p class="text-gray-400 text-xs mb-3">${t('contentManager.modules.hint')}</p>
+            <div id="add-module-form-container"></div>
+            <div id="course-modules-list">
+                <p class="text-gray-400 text-sm text-center py-4"><i class="fas fa-spinner fa-spin mr-1"></i> ${t('contentManager.modules.loading')}</p>
+            </div>
+        </div>
+    `;
+}
+
+async function loadCourseModulesList(courseId) {
+    const container = document.getElementById('course-modules-list');
+    if (!container) return;
+    try {
+        const response = await courseModulesAPI.getByCourse(courseId);
+        const modules = response.data || [];
+        container.innerHTML = modules.length === 0
+            ? `<p class="text-gray-500 text-sm text-center py-4">${t('contentManager.modules.empty')}</p>`
+            : modules.map(m => renderModuleCard(courseId, m)).join('');
+    } catch (error) {
+        container.innerHTML = `<p class="text-sm text-red-500 text-center py-4">${t('contentManager.modules.load_failed')}</p>`;
+    }
+}
+
+function renderModuleCard(courseId, module) {
+    const courseCount = module.courses.length;
+    return `
+        <details class="border border-gray-100 rounded-lg mb-3" open data-module-id="${module.id}">
+            <summary class="manager-row cursor-pointer list-none p-3 flex items-center justify-between gap-2">
+                <div class="manager-row-title flex items-center gap-2 min-w-0">
+                    <i class="fas fa-chevron-right text-gray-400 text-xs module-chevron transition-transform"></i>
+                    <i class="fas fa-layer-group text-cenat-green"></i>
+                    <span class="font-semibold text-gray-900 truncate">${escapeHtml(module.title)}</span>
+                    <span class="text-xs text-gray-400 whitespace-nowrap">(${t(courseCount === 1 ? 'contentManager.modules.course_count_singular' : 'contentManager.modules.course_count_plural', { count: courseCount })})</span>
+                </div>
+                <div class="flex items-center gap-1 flex-shrink-0">
+                    <button onclick="event.preventDefault(); showAddModuleCourseForm(${courseId}, ${module.id})" class="text-xs border border-green-200 bg-green-50 text-cenat-green px-2 py-1 rounded hover:bg-green-100 whitespace-nowrap" title="${t('contentManager.modules.create_course_title')}">
+                        <i class="fas fa-plus mr-1"></i>${t('contentManager.modules.create_course_short')}
+                    </button>
+                    <button onclick="event.preventDefault(); renameModuleHandler(${courseId}, ${module.id})" class="text-gray-400 hover:text-cenat-green px-2" title="${t('contentManager.modules.rename_title')}" aria-label="${t('contentManager.modules.rename_title')}">
+                        <i class="fas fa-pencil-alt"></i>
+                    </button>
+                    <button onclick="event.preventDefault(); deleteModuleHandler(${courseId}, ${module.id})" class="text-red-500 hover:text-red-700 px-2" title="${t('contentManager.modules.delete_title')}" aria-label="${t('contentManager.modules.delete_title')}">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+            </summary>
+            <div class="px-3 pb-3 border-t border-gray-100 pt-3 space-y-2">
+                <div id="${scopeId('add-module-course-form-container', module.id)}"></div>
+                ${courseCount === 0
+                    ? `<p class="text-gray-400 text-xs text-center py-2">${t('contentManager.modules.no_courses_yet')}</p>`
+                    : module.courses.map(c => renderModuleChildCourseRow(courseId, module.id, c)).join('')}
+            </div>
+        </details>
+    `;
+}
+
+function renderModuleChildCourseRow(courseId, moduleId, childCourse) {
+    const manageHref = (typeof isAdmin === 'function' && isAdmin())
+        ? `#/admin/courses/${childCourse.id}/edit`
+        : `#/teacher/courses/${childCourse.id}/edit`;
+    return `
+        <div class="bg-gray-50 rounded-lg px-3 py-2">
+            <div class="manager-row flex items-center justify-between gap-2">
+                <div class="manager-row-title flex items-center gap-2 min-w-0">
+                    <div class="w-10 h-10 rounded bg-gradient-to-br from-cenat-green to-cenat-green-light flex items-center justify-center overflow-hidden flex-shrink-0">
+                        ${childCourse.thumbnail
+                            ? `<img src="${escapeAttr(childCourse.thumbnail)}" alt="${escapeAttr(localizedText(childCourse, 'title'))}" class="w-full h-full object-cover" loading="lazy" decoding="async">`
+                            : `<i class="fas fa-flask text-white text-sm"></i>`}
+                    </div>
+                    <div class="min-w-0">
+                        <p class="text-sm font-medium text-gray-900 truncate">${escapeHtml(localizedText(childCourse, 'title'))}</p>
+                        <p class="text-xs text-gray-400 truncate">${childCourse.teacher_names ? escapeHtml(childCourse.teacher_names) : t('contentManager.modules.no_teacher_assigned')}</p>
+                    </div>
+                </div>
+                <div class="flex items-center gap-1 flex-shrink-0">
+                    <button onclick="toggleModuleChildTeacherEditor(${courseId}, ${moduleId}, ${childCourse.id})" class="text-xs text-gray-400 hover:text-cenat-green px-2" title="${t('contentManager.modules.edit_teachers_title')}" aria-label="${t('contentManager.modules.edit_teachers_title')}">
+                        <i class="fas fa-user-edit"></i>
+                    </button>
+                    <a href="${manageHref}" class="text-xs border border-gray-300 bg-gray-100 text-gray-700 px-2 py-1 rounded hover:bg-gray-200" title="${t('contentManager.modules.manage_content_title')}" aria-label="${t('contentManager.modules.manage_content_title')}">
+                        <i class="fas fa-cog"></i>
+                    </a>
+                    <button onclick="unnestModuleCourseHandler(${courseId}, ${moduleId}, ${childCourse.id})" class="text-xs text-gray-400 hover:text-red-600 px-2" title="${t('contentManager.modules.unlink_title')}" aria-label="${t('contentManager.modules.unlink_title')}">
+                        <i class="fas fa-unlink"></i>
+                    </button>
+                </div>
+            </div>
+            <div id="${scopeId('edit-module-course-teachers', childCourse.id)}" class="hidden"></div>
+        </div>
+    `;
+}
+
+/**
+ * Panel inline para editar los profesores de un curso hijo SIN salir de la
+ * tarjeta del módulo — antes había que entrar a editar ese curso hijo
+ * completo solo para cambiarle el profesor. Reusa las mismas piezas que ya
+ * arma/lee la lista de checkboxes de profesores en utils.js
+ * (loadTeacherCheckboxes/getSelectedTeacherIds), sin escopeo por carpeta
+ * (un curso hijo recién creado no tiene carpetas propias, y esta acción
+ * rápida no pretende cubrir ese caso).
+ */
+async function toggleModuleChildTeacherEditor(courseId, moduleId, childId) {
+    const containerId = scopeId('edit-module-course-teachers', childId);
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    if (!container.classList.contains('hidden')) {
+        container.classList.add('hidden');
+        container.innerHTML = '';
+        return;
+    }
+
+    container.classList.remove('hidden');
+    container.innerHTML = `<p class="text-sm text-gray-400 pt-2"><i class="fas fa-spinner fa-spin mr-1"></i> ${t('contentManager.modules.loading_teachers')}</p>`;
+
+    try {
+        const teachersResponse = await coursesAPI.getTeachers(childId);
+        const assignedTeacherIds = (teachersResponse.data?.teachers || []).map(teacher => teacher.id);
+        const teacherListId = scopeId('edit-module-course-teacher-list', childId);
+
+        container.innerHTML = `
+            <div class="bg-white border border-gray-200 rounded-lg p-3 mt-2">
+                <div id="${teacherListId}" class="max-h-56 overflow-y-auto"></div>
+                <div class="flex gap-2 mt-2">
+                    <button onclick="saveModuleChildTeachers(${courseId}, ${moduleId}, ${childId})" class="text-xs bg-cenat-green text-white px-3 py-1.5 rounded-lg font-semibold">
+                        <i class="fas fa-check mr-1"></i> ${t('contentManager.save')}
+                    </button>
+                    <button onclick="toggleModuleChildTeacherEditor(${courseId}, ${moduleId}, ${childId})" class="text-xs text-gray-600 px-3 py-1.5">
+                        ${t('contentManager.cancel')}
+                    </button>
+                </div>
+            </div>
+        `;
+        await loadTeacherCheckboxes(teacherListId, assignedTeacherIds);
+    } catch (error) {
+        container.innerHTML = `<p class="text-sm text-red-500 pt-2">${t('courseForm.load_teachers_failed')}</p>`;
+    }
+}
+
+async function saveModuleChildTeachers(courseId, moduleId, childId) {
+    const teacherListId = scopeId('edit-module-course-teacher-list', childId);
+    const teacherIds = getSelectedTeacherIds(teacherListId);
+
+    const formData = new FormData();
+    formData.append('teacher_ids', JSON.stringify(teacherIds));
+
+    try {
+        await coursesAPI.update(childId, formData);
+        showToast(t('contentManager.modules.teachers_updated'), 'success');
+        contentManagerRerender();
+    } catch (error) {
+        showToast(error.message || t('contentManager.modules.teachers_update_failed'), 'error');
+    }
+}
+
+/**
+ * Formulario de un solo campo (título) para crear un módulo o una carpeta
+ * — mismo layout y misma lógica de envío en ambos casos, solo cambian el
+ * contenedor/ids, el namespace de i18n y la llamada a la API.
+ */
+function showAddTitleOnlyForm(containerId, formId, fieldId, submitBtnId, ns, apiCall) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    container.innerHTML = `
+        <form id="${formId}" class="bg-green-50 rounded-lg p-4 mb-4 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t(`contentManager.${ns}.name_label`)}</label>
+                <input type="text" id="${fieldId}" required maxlength="150" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t(`contentManager.${ns}.name_placeholder`)}">
+            </div>
+            <div class="flex gap-2">
+                <button type="submit" id="${submitBtnId}" class="bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-check mr-1"></i> ${t(`contentManager.${ns}.create_button`)}
+                </button>
+                <button type="button" onclick="document.getElementById('${containerId}').innerHTML = ''" class="border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">
+                    ${t('contentManager.cancel')}
+                </button>
+            </div>
+        </form>
+    `;
+
+    document.getElementById(formId).addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = document.getElementById(fieldId).value.trim();
+        const submitBtn = document.getElementById(submitBtnId);
+
+        if (!title) {
+            showToast(t(`contentManager.${ns}.name_required`), 'error');
+            return;
+        }
+
+        await submitContentForm(submitBtn, {
+            loadingLabel: t('contentManager.creating'),
+            idleLabel: `<i class="fas fa-check mr-1"></i> ${t(`contentManager.${ns}.create_button`)}`,
+            apiCall: () => apiCall(title),
+            successMessage: t(`contentManager.${ns}.created`),
+            errorMessage: t(`contentManager.${ns}.create_failed`)
+        });
+    });
+}
+
+function showAddModuleForm(courseId) {
+    showAddTitleOnlyForm(
+        'add-module-form-container', 'add-module-form', 'module-title', 'submit-module-btn',
+        'modules', (title) => courseModulesAPI.create(courseId, title)
+    );
+}
+
+async function renameModuleHandler(courseId, moduleId) {
+    // El título actual se lee del propio DOM (en vez de pasarlo como
+    // argumento del onclick) para no tener que escapar un string arbitrario
+    // dentro de un atributo HTML inline — más simple y sin riesgo de romper
+    // el markup si el título tiene comillas.
+    const titleEl = document.querySelector(`details[data-module-id="${moduleId}"] .font-semibold`);
+    const currentTitle = titleEl ? titleEl.textContent : '';
+    const title = await promptText(t('contentManager.modules.rename_prompt'), currentTitle, { maxLength: 150 });
+    if (title === null) return;
+    if (!title.trim()) {
+        showToast(t('contentManager.modules.name_required'), 'error');
+        return;
+    }
+    try {
+        await courseModulesAPI.update(moduleId, { title: title.trim() });
+        showToast(t('contentManager.modules.updated'), 'success');
+        contentManagerRerender();
+    } catch (error) {
+        showToast(error.message || t('contentManager.modules.update_failed'), 'error');
+    }
+}
+
+async function deleteModuleHandler(courseId, moduleId) {
+    const confirmed = await confirmAction(t('contentManager.modules.delete_confirm'));
+    if (!confirmed) return;
+    try {
+        await courseModulesAPI.delete(moduleId);
+        showToast(t('contentManager.modules.deleted'), 'success');
+        contentManagerRerender();
+    } catch (error) {
+        showToast(error.message || t('contentManager.modules.delete_failed'), 'error');
+    }
+}
+
+async function unnestModuleCourseHandler(courseId, moduleId, childId) {
+    const confirmed = await confirmAction(t('contentManager.modules.unlink_confirm'));
+    if (!confirmed) return;
+    try {
+        await courseModulesAPI.removeCourse(moduleId, childId);
+        showToast(t('contentManager.modules.unlinked'), 'success');
+        contentManagerRerender();
+    } catch (error) {
+        showToast(error.message || t('contentManager.modules.unlink_failed'), 'error');
+    }
+}
+
+function showAddModuleCourseForm(courseId, moduleId) {
+    const containerId = scopeId('add-module-course-form-container', moduleId);
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    const teacherCheckboxesId = scopeId('module-course-teachers', moduleId);
+
+    container.innerHTML = `
+        <form id="add-module-course-form-${moduleId}" class="bg-green-50 rounded-lg p-4 mb-3 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.modules.course_title_label')}</label>
+                <input type="text" id="module-course-title-${moduleId}" required maxlength="150" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('contentManager.modules.course_title_placeholder')}">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.modules.description_label')}</label>
+                <textarea id="module-course-description-${moduleId}" rows="2" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green"></textarea>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.modules.thumbnail_label')}</label>
+                <div class="file-drop-zone" id="module-course-thumbnail-drop-zone-${moduleId}">
+                    <i class="fas fa-image text-2xl text-gray-400 mb-1"></i>
+                    <p class="text-xs text-gray-500">${t('admin.createCourse.thumbnail_drop_hint')}</p>
+                    <p class="text-xs text-gray-400 mt-1">${t('admin.createCourse.thumbnail_formats_hint')}</p>
+                    <input type="file" id="module-course-thumbnail-${moduleId}" accept="image/*" class="hidden">
+                </div>
+                <div id="module-course-thumbnail-preview-${moduleId}" class="mt-2 hidden">
+                    <img id="module-course-thumbnail-preview-img-${moduleId}" alt="${escapeAttr(t('common.image_preview_alt'))}" class="h-20 rounded-lg object-cover">
+                </div>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.modules.teacher_label')}</label>
+                <div id="${teacherCheckboxesId}" class="border border-gray-300 rounded-lg p-3 max-h-56 overflow-y-auto bg-white">
+                    <p class="text-sm text-gray-400"><i class="fas fa-spinner fa-spin mr-1"></i> ${t('contentManager.modules.loading_teachers')}</p>
+                </div>
+            </div>
+            <div class="flex gap-2">
+                <button type="submit" id="submit-module-course-btn-${moduleId}" class="bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-check mr-1"></i> ${t('contentManager.modules.create_course_button')}
+                </button>
+                <button type="button" onclick="document.getElementById('${containerId}').innerHTML = ''" class="border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">
+                    ${t('contentManager.cancel')}
+                </button>
+            </div>
+        </form>
+    `;
+
+    loadTeacherCheckboxes(teacherCheckboxesId);
+    setupThumbnailDropZone({
+        dropZoneId: `module-course-thumbnail-drop-zone-${moduleId}`,
+        inputId: `module-course-thumbnail-${moduleId}`,
+        previewContainerId: `module-course-thumbnail-preview-${moduleId}`,
+        previewImgId: `module-course-thumbnail-preview-img-${moduleId}`
+    });
+
+    document.getElementById(`add-module-course-form-${moduleId}`).addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = document.getElementById(`module-course-title-${moduleId}`).value.trim();
+        const description = document.getElementById(`module-course-description-${moduleId}`).value.trim();
+        const thumbnailFile = document.getElementById(`module-course-thumbnail-${moduleId}`).files[0];
+        const submitBtn = document.getElementById(`submit-module-course-btn-${moduleId}`);
+
+        if (!title) {
+            showToast(t('contentManager.modules.course_title_required'), 'error');
+            return;
+        }
+        if (thumbnailFile && !checkFileSize(thumbnailFile, MAX_IMAGE_BYTES, t('contentManager.modules.thumbnail_field_label'))) return;
+
+        const formData = new FormData();
+        formData.append('title', title);
+        formData.append('description', description);
+        formData.append('teacher_ids', JSON.stringify(getSelectedTeacherIds(teacherCheckboxesId)));
+        if (thumbnailFile) formData.append('thumbnail', thumbnailFile);
+
+        await submitContentForm(submitBtn, {
+            loadingLabel: t('contentManager.creating'),
+            idleLabel: `<i class="fas fa-check mr-1"></i> ${t('contentManager.modules.create_course_button')}`,
+            apiCall: () => courseModulesAPI.createCourse(moduleId, formData),
+            successMessage: t('contentManager.modules.course_created'),
+            errorMessage: t('contentManager.modules.create_course_failed')
+        });
+    });
+}
+
+/**
+ * Una carpeta se dibuja como un ítem arrastrable más dentro de la lista
+ * "Contenido" (ver mixedSection en renderContentTypeSections), no como
+ * sección aparte — así se puede reordenar respecto a una tarea o un foro,
+ * o incluso subirla por encima de Videos. Por dentro sigue siendo un
+ * <details> con sus propias secciones de contenido (renderContentTypeSections
+ * recursivo, folderId = el id de esta carpeta).
+ */
+function renderDraggableFolderItem(courseId, contents, folder) {
+    const itemCount = contents.filter(c => c.folder_id === folder.id).length;
+    return `
+        <div class="draggable-item flex items-stretch gap-1" draggable="true" data-content-id="${folder.id}" data-content-json="${encodeDataAttr(folder)}">
+            <span class="drag-handle flex items-center px-1 text-gray-300 hover:text-gray-500 cursor-grab flex-shrink-0" title="${t('contentManager.drag_handle_title')}">
+                <i class="fas fa-grip-vertical"></i>
+            </span>
+            ${renderReorderButtons(folder.id)}
+            <div class="flex-1 min-w-0">
+                <div id="content-display-${folder.id}">
+                    <details class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden" open>
+                        <summary class="manager-row cursor-pointer list-none p-4 flex items-center justify-between gap-2">
+                            <div class="manager-row-title flex items-center gap-2 min-w-0">
+                                <i class="fas fa-chevron-right text-gray-400 text-xs folder-chevron transition-transform"></i>
+                                <i class="fas fa-folder-open text-cenat-green"></i>
+                                <span class="font-bold text-gray-900 truncate">${escapeHtml(localizedText(folder, 'title'))}</span>
+                                <span class="text-xs text-gray-400 whitespace-nowrap">(${t(itemCount === 1 ? 'contentManager.item_count_singular' : 'contentManager.item_count_plural', { count: itemCount })})</span>
+                                ${folder.module_teacher_name ? `
+                                    <span class="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full whitespace-nowrap" title="${t('contentManager.folders.assigned_teacher_title')}">
+                                        <i class="fas fa-user-tie mr-1"></i>${escapeHtml(folder.module_teacher_name)}
+                                    </span>
+                                ` : ''}
+                            </div>
+                            <div class="flex items-center gap-1 flex-shrink-0">
+                                <button onclick="event.preventDefault(); editContentHandler(${folder.id})" class="text-gray-400 hover:text-cenat-green px-2" title="${t('contentManager.folders.edit_title')}" aria-label="${t('contentManager.folders.edit_title')}">
+                                    <i class="fas fa-pencil-alt"></i>
+                                </button>
+                                <button onclick="event.preventDefault(); deleteContentHandler(${folder.id}, 'folder')" class="text-red-500 hover:text-red-700 px-2" title="${t('contentManager.folders.delete_title')}" aria-label="${t('contentManager.folders.delete_title')}">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </div>
+                        </summary>
+                        <div class="px-4 pb-4 space-y-4 border-t border-gray-100 pt-4">
+                            ${renderContentTypeSections(courseId, contents, folder.id, true)}
+                        </div>
+                    </details>
+                </div>
+                <div id="content-edit-${folder.id}"></div>
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Videos con su propia sección (a nivel superior comparten reproductor
+ * con la vista del estudiante), y el resto de tipos (URL/Archivo/Texto/
+ * Tarea/Foro) en UNA lista única arrastrable, ordenada por order_index —
+ * así el profesor puede, por ejemplo, poner un foro arriba de una tarea.
+ * `folderId` (null = sin carpeta) escopa tanto qué contenido entra en
+ * cada lista como qué ids se reordenan juntos al soltar (ver
+ * persistContentOrder más abajo): mezclar ids de carpetas distintas en
+ * un mismo POST /reorder rompería el orden de la otra carpeta, así que
+ * cada lista es su propio ".sortable-list" independiente. `nested` cambia
+ * el estilo: cards completas con sombra a nivel superior, bloques simples
+ * sin repetir el borde cuando ya están dentro de la card de una carpeta.
+ */
+function renderContentTypeSections(courseId, contents, folderId, nested) {
+    const inScope = c => (c.folder_id || null) === folderId;
+    const videos = contents.filter(c => c.type === 'video' && inScope(c));
+    // Una carpeta siempre tiene folder_id null (no hay subcarpetas), así
+    // que solo puede aparecer en la lista de nivel superior (folderId ===
+    // null) — la llamada recursiva para dibujar el contenido DENTRO de una
+    // carpeta nunca la vuelve a incluir, sin necesidad de excluirla a mano.
+    const mixedItems = contents.filter(c => c.type !== 'video' && inScope(c));
+
+    const folderArg = folderId === null ? 'null' : folderId;
+    const wrap = nested ? '' : 'bg-white rounded-xl shadow-sm border border-gray-100 p-6';
+    const headingSize = nested ? 'text-sm' : 'text-lg';
+
+    const videoSection = `
+        <div class="${wrap}">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="${headingSize} font-bold text-gray-900">
+                    <i class="fas fa-video text-cenat-green mr-2"></i> ${t('contentManager.videos.heading')}
+                </h3>
+                <button onclick="showAddVideoForm(${courseId}, ${folderArg})" class="text-xs border border-green-200 bg-green-50 text-cenat-green px-3 py-1.5 rounded-lg hover:bg-green-100 transition">
+                    <i class="fas fa-plus mr-1"></i> ${t('contentManager.videos.add')}
+                </button>
+            </div>
+            <div id="${scopeId('add-video-form-container', folderId)}"></div>
+            <div id="${scopeId('video-list', folderId)}" class="space-y-2 sortable-list" data-course-id="${courseId}">
+                ${videos.length > 0 ? videos.map(renderDraggableItem).join('') : `
+                    <p class="text-gray-500 text-sm text-center py-4">${t('contentManager.videos.empty')}</p>
+                `}
+            </div>
+        </div>
+    `;
+
+    const addButtons = [
+        ['showAddUrlForm', 'fa-link', t('contentManager.addButtons.url')],
+        ['showAddFileForm', 'fa-file', t('contentManager.addButtons.file')],
+        ['showAddImageForm', 'fa-image', t('contentManager.addButtons.image')],
+        ['showAddTextForm', 'fa-align-left', t('contentManager.addButtons.text')],
+        ['showAddTaskForm', 'fa-tasks', t('contentManager.addButtons.task')],
+        ['showAddQuizForm', 'fa-question-circle', t('contentManager.addButtons.quiz')],
+        ['showAddSurveyForm', 'fa-poll', t('contentManager.addButtons.survey')],
+        ['showAddForumForm', 'fa-comments', t('contentManager.addButtons.forum')]
+    ].map(([fn, icon, label]) => `
+        <button onclick="${fn}(${courseId}, ${folderArg})" class="text-xs border border-green-200 bg-green-50 text-cenat-green px-3 py-1.5 rounded-lg hover:bg-green-100 transition whitespace-nowrap">
+            <i class="fas ${icon} mr-1"></i> ${label}
+        </button>
+    `).join('');
+
+    const mixedSection = `
+        <div class="${wrap}">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <h3 class="${headingSize} font-bold text-gray-900">
+                    <i class="fas fa-list text-cenat-green mr-2"></i> ${t('contentManager.content.heading')}
+                </h3>
+                <div class="flex flex-wrap gap-2">${addButtons}</div>
+            </div>
+            <div id="${scopeId('add-url-form-container', folderId)}"></div>
+            <div id="${scopeId('add-file-form-container', folderId)}"></div>
+            <div id="${scopeId('add-image-form-container', folderId)}"></div>
+            <div id="${scopeId('add-text-form-container', folderId)}"></div>
+            <div id="${scopeId('add-task-form-container', folderId)}"></div>
+            <div id="${scopeId('add-quiz-form-container', folderId)}"></div>
+            <div id="${scopeId('add-survey-form-container', folderId)}"></div>
+            <div id="${scopeId('add-forum-form-container', folderId)}"></div>
+            ${mixedItems.length > 1 ? `
+                <p class="text-xs text-gray-400 mb-2"><i class="fas fa-arrows-alt-v mr-1"></i> ${t('contentManager.drag_to_reorder')}</p>
+            ` : ''}
+            <div id="${scopeId('content-list', folderId)}" class="space-y-2 sortable-list" data-course-id="${courseId}">
+                ${mixedItems.length > 0 ? mixedItems.map(item => item.type === 'folder'
+                    ? renderDraggableFolderItem(courseId, contents, item)
+                    : renderDraggableItem(item)
+                ).join('') : `
+                    <p class="text-gray-500 text-sm text-center py-4">${t('contentManager.content.empty')}</p>
+                `}
+            </div>
+        </div>
+    `;
+
+    return videoSection + mixedSection;
+}
+
+/**
+ * Dispatcher: cada tipo de contenido se dibuja con el mismo renderer de
+ * fila que ya existía por tipo — reutilizarlos evita duplicar el markup.
+ */
+function renderManagerContentItem(content) {
+    switch (content.type) {
+        case 'video': return renderContentItem(content, 'video');
+        case 'url': return renderContentItem(content, 'url');
+        case 'file': return renderContentItem(content, 'file');
+        case 'image': return renderContentItem(content, 'image');
+        case 'text': return renderContentItem(content, 'text');
+        case 'task': return renderTaskItem(content);
+        case 'quiz': return renderQuizManagerItem(content);
+        case 'survey': return renderQuizManagerItem(content);
+        case 'forum': return renderForumItem(content);
+        default: return '';
+    }
+}
+
+/**
+ * Mete un objeto como JSON dentro de un atributo HTML de forma segura —
+ * usado para guardar el contenido completo (título/descripción/url/tipo)
+ * en cada fila, así editContentHandler no necesita volver a pedirlo al
+ * servidor. escapeHtml() no alcanza acá: está pensado para texto DENTRO
+ * de un tag, no escapa comillas — y un JSON.stringify está lleno de `"`.
+ */
+function encodeDataAttr(obj) {
+    return JSON.stringify(obj).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+}
+
+/**
+ * Botones de subir/bajar — alternativa por teclado/lector de pantalla al
+ * arrastre con mouse, que por su naturaleza no es operable de otra forma.
+ * Reutilizan exactamente el mismo persistContentOrder() que usa soltar un
+ * drag, así que quedan sujetos a las mismas reglas (solo se mueve dentro
+ * de la misma lista/carpeta).
+ */
+function renderReorderButtons(contentId) {
+    return `
+        <span class="reorder-buttons flex flex-col justify-center flex-shrink-0">
+            <button type="button" onclick="moveContentItem(${contentId}, -1)" class="reorder-btn text-gray-300 hover:text-cenat-green leading-none px-1" title="${t('contentManager.move_up')}" aria-label="${t('contentManager.move_up')}">
+                <i class="fas fa-chevron-up text-xs"></i>
+            </button>
+            <button type="button" onclick="moveContentItem(${contentId}, 1)" class="reorder-btn text-gray-300 hover:text-cenat-green leading-none px-1" title="${t('contentManager.move_down')}" aria-label="${t('contentManager.move_down')}">
+                <i class="fas fa-chevron-down text-xs"></i>
+            </button>
+        </span>
+    `;
+}
+
+/**
+ * Intercambia un .draggable-item con su vecino directo (arriba si
+ * direction=-1, abajo si direction=1) dentro de su propio .sortable-list,
+ * y persiste el nuevo orden — mismo criterio de "hijos directos
+ * solamente" que getDragAfterElement/persistContentOrder: un item nunca
+ * tiene como previousElementSibling/nextElementSibling algo de OTRA
+ * lista, porque las listas anidadas de una carpeta viven más adentro en
+ * el DOM, no como hermanas.
+ */
+async function moveContentItem(contentId, direction) {
+    const item = document.querySelector(`.draggable-item[data-content-id="${contentId}"]`);
+    if (!item) return;
+    const container = item.closest('.sortable-list');
+    if (!container) return;
+
+    const target = direction < 0 ? item.previousElementSibling : item.nextElementSibling;
+    if (!target || !target.classList.contains('draggable-item')) return;
+
+    if (direction < 0) {
+        container.insertBefore(item, target);
+    } else {
+        container.insertBefore(target, item);
+    }
+
+    await persistContentOrder(container);
+}
+
+/**
+ * Envuelve una fila de contenido con lo necesario para arrastrarla:
+ * `draggable="true"`, un mango visual (decorativo — arrastrar desde
+ * cualquier parte de la fila funciona igual, salvo desde un botón/link,
+ * que el navegador no deja iniciar un drag ahí por default), botones de
+ * subir/bajar (ver renderReorderButtons), y `data-content-id`/
+ * `data-content-json` para leer el nuevo orden al soltar y los datos del
+ * contenido al editar. `content-display-{id}` / `content-edit-{id}` son
+ * el par que usa editContentHandler para mostrar el formulario de
+ * edición en el lugar de la fila, sin tener que reordenar el resto del
+ * markup por tipo.
+ */
+function renderDraggableItem(content) {
+    return `
+        <div class="draggable-item flex items-stretch gap-1" draggable="true" data-content-id="${content.id}" data-content-json="${encodeDataAttr(content)}">
+            <span class="drag-handle flex items-center px-1 text-gray-300 hover:text-gray-500 cursor-grab flex-shrink-0" title="${t('contentManager.drag_handle_title')}">
+                <i class="fas fa-grip-vertical"></i>
+            </span>
+            ${renderReorderButtons(content.id)}
+            <div class="flex-1 min-w-0">
+                <div id="content-display-${content.id}">${renderManagerContentItem(content)}</div>
+                <div id="content-edit-${content.id}"></div>
+            </div>
+        </div>
+    `;
+}
+
+// =================================
+// Drag-and-drop para reordenar contenido
+// =================================
+// Delegado en document (no en cada lista): las listas se reconstruyen
+// por completo en cada re-render, así que un listener por documento no
+// necesita re-engancharse cada vez que se agrega/borra/reordena algo.
+
+let draggedItem = null;
+
+document.addEventListener('dragstart', (e) => {
+    const item = e.target.closest('.draggable-item');
+    if (!item) return;
+    draggedItem = item;
+    e.dataTransfer.effectAllowed = 'move';
+    setTimeout(() => item.classList.add('opacity-40'), 0);
+});
+
+document.addEventListener('dragend', () => {
+    if (draggedItem) draggedItem.classList.remove('opacity-40');
+    draggedItem = null;
+});
+
+/**
+ * true si `container` es la lista de la que salió `draggedItem` — NO
+ * alcanza con `container.contains(draggedItem)`: desde que una carpeta es
+ * un ítem arrastrable más de la lista de nivel superior (ver
+ * renderDraggableFolderItem), la lista interna de esa carpeta queda
+ * anidada DENTRO del DOM de la lista externa, así que "contains" da true
+ * aunque sean listas distintas — eso dejaba sacar un contenido de adentro
+ * de una carpeta arrastrándolo hacia afuera (o viceversa). Comparando
+ * contra el ".sortable-list" ancestro más cercano del propio ítem
+ * arrastrado nos aseguramos de que sea EXACTAMENTE la misma lista.
+ */
+function isSameSortableList(container, item) {
+    return !!container && item.closest('.sortable-list') === container;
+}
+
+document.addEventListener('dragover', (e) => {
+    if (!draggedItem) return;
+    const container = e.target.closest('.sortable-list');
+    // Solo se puede reordenar DENTRO de la misma lista (misma carpeta/nivel
+    // Y mismo tipo de lista, Videos o Contenido) — arrastrar hacia otra
+    // lista no hace nada, a propósito: no se mueve contenido entre
+    // carpetas ni entre Videos y Contenido arrastrando.
+    if (!isSameSortableList(container, draggedItem)) return;
+    e.preventDefault();
+
+    const afterElement = getDragAfterElement(container, e.clientY);
+    if (afterElement == null) {
+        container.appendChild(draggedItem);
+    } else {
+        container.insertBefore(draggedItem, afterElement);
+    }
+});
+
+document.addEventListener('drop', async (e) => {
+    if (!draggedItem) return;
+    const container = e.target.closest('.sortable-list');
+    if (!isSameSortableList(container, draggedItem)) return;
+    e.preventDefault();
+    await persistContentOrder(container);
+});
+
+function getDragAfterElement(container, y) {
+    // ":scope >" limita a los hijos DIRECTOS de esta lista — necesario
+    // ahora que una carpeta puede contener su propia lista arrastrable
+    // anidada (ver renderDraggableFolderItem); sin el ":scope >", un
+    // querySelectorAll normal también trae los ítems de DENTRO de una
+    // carpeta expandida y rompe el cálculo de posición.
+    const items = [...container.querySelectorAll(':scope > .draggable-item:not(.opacity-40)')];
+    return items.reduce((closest, child) => {
+        const box = child.getBoundingClientRect();
+        const offset = y - box.top - box.height / 2;
+        if (offset < 0 && offset > closest.offset) {
+            return { offset, element: child };
+        }
+        return closest;
+    }, { offset: Number.NEGATIVE_INFINITY, element: null }).element;
+}
+
+/**
+ * Persiste el orden visual actual de una lista contra el servidor. Si
+ * falla, se vuelve a renderizar todo el panel para recuperar el orden
+ * real (el UPDATE no llegó a aplicarse, así que el servidor sigue
+ * teniendo el orden de antes de arrastrar).
+ */
+async function persistContentOrder(container) {
+    const courseId = container.dataset.courseId;
+    // Mismo motivo que en getDragAfterElement: solo los hijos directos son
+    // los que pertenecen a ESTA lista/carpeta — los de una carpeta anidada
+    // expandida adentro se reordenan con su propio POST /reorder aparte.
+    const ids = [...container.querySelectorAll(':scope > .draggable-item')].map(el => Number(el.dataset.contentId));
+
+    try {
+        await contentsAPI.reorder(courseId, ids);
+    } catch (error) {
+        showToast(error.message || t('contentManager.reorder_failed'), 'error');
+        contentManagerRerender();
+    }
+}
+
+function renderContentItem(content, type) {
+    const icons = { video: 'fa-play-circle', url: 'fa-link', text: 'fa-align-left', task: 'fa-tasks', image: 'fa-image' };
+    const icon = icons[type] || getFileIcon(content.url);
+    return `
+        <div class="manager-row flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:border-gray-300 transition">
+            ${type === 'image'
+                ? `<img src="${escapeAttr(content.url)}" alt="" class="w-10 h-10 rounded object-cover flex-shrink-0" loading="lazy" decoding="async">`
+                : `<i class="fas ${icon} text-xl text-cenat-green"></i>`
+            }
+            <div class="flex-1 min-w-0">
+                <p class="font-medium text-gray-900 truncate">${escapeHtml(localizedText(content, 'title'))}</p>
+                ${content.file_size ? `<p class="text-xs text-gray-500">${formatFileSize(content.file_size)}</p>` : ''}
+                ${type === 'url' ? `<p class="text-xs text-gray-500 truncate">${escapeHtml(content.url)}</p>` : ''}
+            </div>
+            <button onclick="editContentHandler(${content.id})" class="text-gray-400 hover:text-cenat-green px-2" title="${t('contentManager.edit_title')}" aria-label="${t('contentManager.edit_title')}">
+                <i class="fas fa-pencil-alt"></i>
+            </button>
+            <button onclick="deleteContentHandler(${content.id}, '${type}')" class="text-red-500 hover:text-red-700 px-2" title="${t('contentManager.delete_title')}" aria-label="${t('contentManager.delete_title')}">
+                <i class="fas fa-trash"></i>
+            </button>
+        </div>
+    `;
+}
+
+function renderTaskItem(content) {
+    return `
+        <div class="manager-row flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:border-gray-300 transition">
+            <i class="fas fa-tasks text-xl text-cenat-green"></i>
+            <div class="flex-1 min-w-0">
+                <p class="font-medium text-gray-900 truncate">${escapeHtml(localizedText(content, 'title'))}</p>
+                <p class="text-xs text-gray-500">${content.url ? t('contentManager.task.with_instructions_file') : t('contentManager.task.no_attached_file')}</p>
+            </div>
+            <a href="#/contents/${content.id}/submissions" class="text-cenat-green hover:text-cenat-green-hover text-sm whitespace-nowrap" title="${t('contentManager.task.view_submissions_title')}">
+                <i class="fas fa-inbox mr-1"></i> ${t('contentManager.task.view_submissions')}
+            </a>
+            <button onclick="editContentHandler(${content.id})" class="text-gray-400 hover:text-cenat-green px-2" title="${t('contentManager.edit_title')}" aria-label="${t('contentManager.edit_title')}">
+                <i class="fas fa-pencil-alt"></i>
+            </button>
+            <button onclick="deleteContentHandler(${content.id}, 'task')" class="text-red-500 hover:text-red-700 px-2" title="${t('contentManager.delete_title')}" aria-label="${t('contentManager.delete_title')}">
+                <i class="fas fa-trash"></i>
+            </button>
+        </div>
+    `;
+}
+
+function renderQuizManagerItem(content) {
+    const isQuiz = content.type === 'quiz';
+    const questionCount = content.question_count || 0;
+    return `
+        <div class="manager-row flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:border-gray-300 transition">
+            <i class="fas ${isQuiz ? 'fa-question-circle' : 'fa-poll'} text-xl text-cenat-green"></i>
+            <div class="flex-1 min-w-0">
+                <p class="font-medium text-gray-900 truncate">${escapeHtml(localizedText(content, 'title'))}</p>
+                <p class="text-xs text-gray-500">${t(questionCount === 1 ? 'contentManager.quiz.question_count_singular' : 'contentManager.quiz.question_count_plural', { count: questionCount })}</p>
+            </div>
+            <a href="#/contents/${content.id}/results" class="text-cenat-green hover:text-cenat-green-hover text-sm whitespace-nowrap" title="${t('contentManager.quiz.view_results_title')}">
+                <i class="fas fa-chart-bar mr-1"></i> ${t('contentManager.quiz.view_results')}
+            </a>
+            <button onclick="editContentHandler(${content.id})" class="text-gray-400 hover:text-cenat-green px-2" title="${t('contentManager.edit_title')}" aria-label="${t('contentManager.edit_title')}">
+                <i class="fas fa-pencil-alt"></i>
+            </button>
+            <button onclick="deleteContentHandler(${content.id}, '${content.type}')" class="text-red-500 hover:text-red-700 px-2" title="${t('contentManager.delete_title')}" aria-label="${t('contentManager.delete_title')}">
+                <i class="fas fa-trash"></i>
+            </button>
+        </div>
+    `;
+}
+
+function renderForumItem(content) {
+    return `
+        <div class="manager-row flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:border-gray-300 transition">
+            <i class="fas fa-comments text-xl text-cenat-green"></i>
+            <div class="flex-1 min-w-0">
+                <p class="font-medium text-gray-900 truncate">${escapeHtml(localizedText(content, 'title'))}</p>
+                <p class="expandable-text text-xs text-gray-500 line-clamp-2">${escapeHtml(localizedText(content, 'description') || '')}</p>
+            </div>
+            <a href="#/forum/${content.id}" class="text-cenat-green hover:text-cenat-green-hover text-sm whitespace-nowrap" title="${t('contentManager.forum.view')}">
+                <i class="fas fa-comment-dots mr-1"></i> ${t('contentManager.forum.view')}
+            </a>
+            <button onclick="editContentHandler(${content.id})" class="text-gray-400 hover:text-cenat-green px-2" title="${t('contentManager.edit_title')}" aria-label="${t('contentManager.edit_title')}">
+                <i class="fas fa-pencil-alt"></i>
+            </button>
+            <button onclick="deleteContentHandler(${content.id}, 'forum')" class="text-red-500 hover:text-red-700 px-2" title="${t('contentManager.delete_title')}" aria-label="${t('contentManager.delete_title')}">
+                <i class="fas fa-trash"></i>
+            </button>
+        </div>
+    `;
+}
+
+/**
+ * Boilerplate compartido por el submit de cada formulario "Agregar X"
+ * (carpeta/video/archivo/imagen/texto/url/foro/tarea/quiz/encuesta):
+ * deshabilita el botón con un spinner, llama la API, muestra el toast de
+ * éxito y re-renderiza el panel — o restaura el botón a su texto normal
+ * si falló. Lo específico de cada formulario (qué campos leer, validarlos,
+ * armar el payload/FormData, y qué endpoint llamar) sigue viviendo en
+ * cada showAddXForm — solo este tramo final, idéntico en los 9, se
+ * comparte acá.
+ */
+async function submitContentForm(submitBtn, { loadingLabel, idleLabel, apiCall, successMessage, errorMessage }) {
+    try {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<i class="fas fa-spinner fa-spin mr-1"></i> ${loadingLabel}`;
+
+        await apiCall();
+        showToast(successMessage, 'success');
+        contentManagerRerender();
+
+    } catch (error) {
+        showToast(error.message || errorMessage, 'error');
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = idleLabel;
+    }
+}
+
+// =================================
+// Formulario para crear CARPETA
+// =================================
+
+/**
+ * No reusa showAddTitleOnlyForm (a diferencia de antes) porque una carpeta
+ * SÍ es traducible (title_en opcional, ver four_feature_batch_2026_10_07
+ * item 2) y el módulo-curso-anidado (que también usa ese helper genérico,
+ * ver showAddModuleForm) NO lo es — son conceptos de "módulo" distintos,
+ * ver la nota grande sobre esa distinción más abajo en este archivo.
+ */
+function showAddFolderForm(courseId) {
+    const containerId = 'add-folder-form-container';
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    container.innerHTML = `
+        <form id="add-folder-form" class="bg-green-50 rounded-lg p-4 mb-4 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.folders.name_label')}</label>
+                <input type="text" id="folder-title" required maxlength="150" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('contentManager.folders.name_placeholder')}">
+                ${bilingualToggleHTML('add-folder-en-fields', `
+                    <input type="text" id="folder-title-en" maxlength="150" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_title_label')}">
+                `)}
+            </div>
+            <div class="flex gap-2">
+                <button type="submit" id="submit-folder-btn" class="bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-check mr-1"></i> ${t('contentManager.folders.create_button')}
+                </button>
+                <button type="button" onclick="document.getElementById('${containerId}').innerHTML = ''" class="border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">
+                    ${t('contentManager.cancel')}
+                </button>
+            </div>
+        </form>
+    `;
+
+    document.getElementById('add-folder-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = document.getElementById('folder-title').value.trim();
+        const titleEn = document.getElementById('folder-title-en').value.trim();
+        const submitBtn = document.getElementById('submit-folder-btn');
+
+        if (!title) {
+            showToast(t('contentManager.folders.name_required'), 'error');
+            return;
+        }
+
+        await submitContentForm(submitBtn, {
+            loadingLabel: t('contentManager.creating'),
+            idleLabel: `<i class="fas fa-check mr-1"></i> ${t('contentManager.folders.create_button')}`,
+            apiCall: () => contentsAPI.createFolder({ course_id: courseId, title, title_en: titleEn }),
+            successMessage: t('contentManager.folders.created'),
+            errorMessage: t('contentManager.folders.create_failed')
+        });
+    });
+}
+
+// =================================
+// Formulario para agregar VIDEO
+// =================================
+
+/**
+ * Formulario compartido por video/archivo/imagen: título + descripción +
+ * archivo requerido + validación de tamaño + submitContentForm — antes eran
+ * 3 funciones casi idénticas. La única diferencia real de comportamiento
+ * entre las tres es la previsualización local (createObjectURL), que solo
+ * tiene sentido para video, así que queda como una opción (`preview`).
+ */
+function showAddFileBasedContentForm(courseId, folderId, { type, ns, fieldName, accept, maxBytes, apiCall, preview = false }) {
+    const container = document.getElementById(scopeId(`add-${type}-form-container`, folderId));
+
+    container.innerHTML = `
+        <form class="add-${type}-form bg-green-50 rounded-lg p-4 mb-4 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t(`contentManager.${ns}.title_label`)}</label>
+                <input type="text" maxlength="150" class="${type}-title w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required placeholder="${t(`contentManager.${ns}.title_placeholder`)}">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t(`contentManager.${ns}.description_label`)}</label>
+                <input type="text" class="${type}-description w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                ${bilingualToggleHTML(scopeId(`add-${type}-en-fields`, folderId), `
+                    <input type="text" maxlength="150" class="${type}-title-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_title_label')}">
+                    <input type="text" class="${type}-description-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_description_label')}">
+                `)}
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t(`contentManager.${ns}.file_label`)}</label>
+                <input type="file" class="${type}-file w-full text-sm" accept="${accept}" required>
+                <p class="text-xs text-gray-500 mt-1">${t(`contentManager.${ns}.formats_hint`)}</p>
+                ${preview ? `<video class="${type}-preview hidden w-full rounded-lg mt-2 max-h-64" controls></video>` : ''}
+            </div>
+            <div class="flex gap-2">
+                <button type="submit" class="submit-${type}-btn bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-upload mr-1"></i> ${t(`contentManager.${ns}.submit`)}
+                </button>
+                <button type="button" class="cancel-add-${type}-btn border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">
+                    ${t('contentManager.cancel')}
+                </button>
+            </div>
+        </form>
+    `;
+
+    const fileInput = container.querySelector(`.${type}-file`);
+    let previewObjectUrl = null;
+
+    // Previsualización local del archivo elegido, antes de subirlo — solo
+    // usa createObjectURL (no toca el servidor), así el profesor puede
+    // confirmar que seleccionó el archivo correcto. Solo video la tiene.
+    if (preview) {
+        const previewEl = container.querySelector(`.${type}-preview`);
+        fileInput.addEventListener('change', () => {
+            if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+            const file = fileInput.files[0];
+            if (!file) {
+                previewEl.classList.add('hidden');
+                previewEl.removeAttribute('src');
+                return;
+            }
+            previewObjectUrl = URL.createObjectURL(file);
+            previewEl.src = previewObjectUrl;
+            previewEl.classList.remove('hidden');
+        });
+    }
+
+    // El blob URL de la preview (si hay) se revoca acá y también al
+    // confirmar con éxito más abajo — sin esto quedaba huérfano en memoria
+    // tanto al cancelar como al subir bien.
+    container.querySelector(`.cancel-add-${type}-btn`).addEventListener('click', () => {
+        if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+        container.innerHTML = '';
+    });
+
+    container.querySelector(`.add-${type}-form`).addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = e.target.querySelector(`.${type}-title`).value.trim();
+        const description = e.target.querySelector(`.${type}-description`).value.trim();
+        const titleEn = e.target.querySelector(`.${type}-title-en`).value.trim();
+        const descriptionEn = e.target.querySelector(`.${type}-description-en`).value.trim();
+        const file = fileInput.files[0];
+        const submitBtn = e.target.querySelector(`.submit-${type}-btn`);
+
+        if (!title || !file) {
+            showToast(t(`contentManager.${ns}.required`), 'error');
+            return;
+        }
+        if (!checkFileSize(file, maxBytes, t(`contentManager.${ns}.field_label`))) return;
+
+        const formData = new FormData();
+        formData.append('course_id', courseId);
+        formData.append('title', title);
+        formData.append('description', description);
+        formData.append('title_en', titleEn);
+        formData.append('description_en', descriptionEn);
+        formData.append(fieldName, file);
+        if (folderId) formData.append('folder_id', folderId);
+
+        await submitContentForm(submitBtn, {
+            loadingLabel: t('contentManager.uploading'),
+            idleLabel: `<i class="fas fa-upload mr-1"></i> ${t(`contentManager.${ns}.submit`)}`,
+            apiCall: async () => {
+                const result = await apiCall(formData);
+                // Recién acá, no antes: si la subida falla, el formulario
+                // (y su preview) siguen visibles para que el profesor
+                // pueda reintentar sin volver a elegir el archivo.
+                if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+                return result;
+            },
+            successMessage: t(`contentManager.${ns}.added`),
+            errorMessage: t(`contentManager.${ns}.add_failed`)
+        });
+    });
+}
+
+function showAddVideoForm(courseId, folderId) {
+    showAddFileBasedContentForm(courseId, folderId, {
+        type: 'video', ns: 'videos', fieldName: 'video', accept: 'video/*',
+        maxBytes: MAX_VIDEO_BYTES, apiCall: contentsAPI.createVideo, preview: true
+    });
+}
+
+// =================================
+// Formulario para agregar ARCHIVO
+// =================================
+
+function showAddFileForm(courseId, folderId) {
+    showAddFileBasedContentForm(courseId, folderId, {
+        type: 'file', ns: 'file', fieldName: 'file',
+        accept: '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip,.rar',
+        maxBytes: MAX_DOC_BYTES, apiCall: contentsAPI.createFile
+    });
+}
+
+// =================================
+// Formulario para agregar IMAGEN
+// =================================
+
+function showAddImageForm(courseId, folderId) {
+    showAddFileBasedContentForm(courseId, folderId, {
+        type: 'image', ns: 'image', fieldName: 'image', accept: 'image/*',
+        maxBytes: MAX_IMAGE_BYTES, apiCall: contentsAPI.createImage
+    });
+}
+
+// =================================
+// Formulario para agregar TEXTO
+// =================================
+
+/**
+ * Formulario compartido por texto/foro: título + un solo textarea +
+ * submitContentForm, sin archivo — la única diferencia real entre ambos es
+ * la etiqueta del textarea, el texto del botón de carga y los mensajes de
+ * éxito/error (que además usan sufijos de i18n distintos: "added" vs
+ * "created"), así que quedan como parámetros explícitos.
+ */
+function showAddSimpleTextForm(courseId, folderId, { type, ns, rows, contentLabelKey, contentPlaceholderKey, loadingLabel, successMessage, errorMessage, apiCall }) {
+    const container = document.getElementById(scopeId(`add-${type}-form-container`, folderId));
+
+    container.innerHTML = `
+        <form class="add-${type}-form bg-green-50 rounded-lg p-4 mb-4 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t(`contentManager.${ns}.title_label`)}</label>
+                <input type="text" maxlength="150" class="${type}-title w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required placeholder="${t(`contentManager.${ns}.title_placeholder`)}">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t(contentLabelKey)}</label>
+                <textarea class="${type}-content w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required rows="${rows}" placeholder="${t(contentPlaceholderKey)}"></textarea>
+                ${bilingualToggleHTML(scopeId(`add-${type}-en-fields`, folderId), `
+                    <input type="text" maxlength="150" class="${type}-title-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_title_label')}">
+                    <textarea class="${type}-content-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" rows="${rows}" placeholder="${t('common.english_text_label')}"></textarea>
+                `)}
+            </div>
+            <div class="flex gap-2">
+                <button type="submit" class="submit-${type}-btn bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-check mr-1"></i> ${t(`contentManager.${ns}.submit`)}
+                </button>
+                <button type="button" onclick="document.getElementById('${scopeId(`add-${type}-form-container`, folderId)}').innerHTML = ''" class="border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">
+                    ${t('contentManager.cancel')}
+                </button>
+            </div>
+        </form>
+    `;
+
+    container.querySelector(`.add-${type}-form`).addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = e.target.querySelector(`.${type}-title`).value.trim();
+        const description = e.target.querySelector(`.${type}-content`).value.trim();
+        const titleEn = e.target.querySelector(`.${type}-title-en`).value.trim();
+        const descriptionEn = e.target.querySelector(`.${type}-content-en`).value.trim();
+        const submitBtn = e.target.querySelector(`.submit-${type}-btn`);
+
+        if (!title || !description) {
+            showToast(t(`contentManager.${ns}.required`), 'error');
+            return;
+        }
+
+        await submitContentForm(submitBtn, {
+            loadingLabel,
+            idleLabel: `<i class="fas fa-check mr-1"></i> ${t(`contentManager.${ns}.submit`)}`,
+            apiCall: () => apiCall({ course_id: courseId, title, description, title_en: titleEn, description_en: descriptionEn, folder_id: folderId || undefined }),
+            successMessage,
+            errorMessage
+        });
+    });
+}
+
+function showAddTextForm(courseId, folderId) {
+    showAddSimpleTextForm(courseId, folderId, {
+        type: 'text', ns: 'text', rows: 5,
+        contentLabelKey: 'contentManager.text.content_label',
+        contentPlaceholderKey: 'contentManager.text.content_placeholder',
+        loadingLabel: t('contentManager.saving'),
+        successMessage: t('contentManager.text.added'),
+        errorMessage: t('contentManager.text.add_failed'),
+        apiCall: contentsAPI.createText
+    });
+}
+
+// =================================
+// Formulario para agregar URL de video externo
+// =================================
+
+function showAddUrlForm(courseId, folderId) {
+    const container = document.getElementById(scopeId('add-url-form-container', folderId));
+
+    container.innerHTML = `
+        <form class="add-url-form bg-green-50 rounded-lg p-4 mb-4 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.url.title_label')}</label>
+                <input type="text" maxlength="150" class="url-title w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required placeholder="${t('contentManager.url.title_placeholder')}">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.url.description_label')}</label>
+                <input type="text" class="url-description w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                ${bilingualToggleHTML(scopeId('add-url-en-fields', folderId), `
+                    <input type="text" maxlength="150" class="url-title-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_title_label')}">
+                    <input type="text" class="url-description-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_description_label')}">
+                `)}
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.url.url_label')}</label>
+                <input type="url" maxlength="500" class="url-value w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required placeholder="${t('contentManager.url.url_placeholder')}">
+                <p class="text-xs text-gray-500 mt-1">${t('contentManager.url.url_hint')}</p>
+            </div>
+            <div class="url-preview-container"></div>
+            <div class="flex gap-2">
+                <button type="submit" class="submit-url-btn bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-check mr-1"></i> ${t('contentManager.url.submit')}
+                </button>
+                <button type="button" onclick="document.getElementById('${scopeId('add-url-form-container', folderId)}').innerHTML = ''" class="border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">
+                    ${t('contentManager.cancel')}
+                </button>
+            </div>
+        </form>
+    `;
+
+    // Previsualización en vivo: al pegar/escribir la URL, si se reconoce
+    // como YouTube/Vimeo se embebe ahí mismo para que el profesor confirme
+    // que es el video correcto antes de guardar. YouTube usa la misma API
+    // oficial que la vista del estudiante (ver createYoutubeEmbed en
+    // utils.js) — un <iframe src="..."> simple resultó fallar en algunos
+    // navegadores/redes (cookies de terceros bloqueadas), mientras que el
+    // embed armado por la API sí funciona ahí.
+    const previewContainer = container.querySelector('.url-preview-container');
+    const previewEmbedId = scopeId('url-preview-embed', folderId);
+    container.querySelector('.url-value').addEventListener('input', debounce((e) => {
+        const url = e.target.value.trim();
+        const youtubeId = getYoutubeVideoId(url);
+        const vimeoUrl = !youtubeId ? getVimeoEmbedUrl(url) : null;
+
+        if (youtubeId) {
+            previewContainer.innerHTML = `
+                <div data-embed-wrapper>
+                    <div class="video-player-container">
+                        <div id="${previewEmbedId}"></div>
+                    </div>
+                    <div data-embed-fallback class="hidden text-sm text-gray-500 bg-gray-50 rounded-lg p-3 mt-2">
+                        <i class="fas fa-triangle-exclamation text-yellow-500 mr-1"></i>
+                        ${t('contentManager.url.preview_failed')}
+                    </div>
+                </div>
+            `;
+            createYoutubeEmbed(previewEmbedId, youtubeId);
+        } else if (vimeoUrl) {
+            previewContainer.innerHTML = `
+                <div class="video-player-container">
+                    <iframe src="${vimeoUrl}" frameborder="0" allowfullscreen></iframe>
+                </div>
+            `;
+        } else {
+            previewContainer.innerHTML = '';
+        }
+    }, 400));
+
+    container.querySelector('.add-url-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = e.target.querySelector('.url-title').value.trim();
+        const description = e.target.querySelector('.url-description').value.trim();
+        const titleEn = e.target.querySelector('.url-title-en').value.trim();
+        const descriptionEn = e.target.querySelector('.url-description-en').value.trim();
+        const url = e.target.querySelector('.url-value').value.trim();
+        const submitBtn = e.target.querySelector('.submit-url-btn');
+
+        if (!title || !url) {
+            showToast(t('contentManager.url.required'), 'error');
+            return;
+        }
+
+        await submitContentForm(submitBtn, {
+            loadingLabel: t('contentManager.saving'),
+            idleLabel: `<i class="fas fa-check mr-1"></i> ${t('contentManager.url.submit')}`,
+            apiCall: () => contentsAPI.createUrl({ course_id: courseId, title, description, title_en: titleEn, description_en: descriptionEn, url, folder_id: folderId || undefined }),
+            successMessage: t('contentManager.url.added'),
+            errorMessage: t('contentManager.url.add_failed')
+        });
+    });
+}
+
+// =================================
+// Formulario para agregar TEMA DE FORO
+// =================================
+
+function showAddForumForm(courseId, folderId) {
+    showAddSimpleTextForm(courseId, folderId, {
+        type: 'forum', ns: 'forum', rows: 4,
+        contentLabelKey: 'contentManager.forum.body_label',
+        contentPlaceholderKey: 'contentManager.forum.body_placeholder',
+        loadingLabel: t('contentManager.creating'),
+        successMessage: t('contentManager.forum.created'),
+        errorMessage: t('contentManager.forum.create_failed'),
+        apiCall: contentsAPI.createForum
+    });
+}
+
+// =================================
+// Formulario para agregar TAREA
+// =================================
+
+function showAddTaskForm(courseId, folderId) {
+    const container = document.getElementById(scopeId('add-task-form-container', folderId));
+
+    container.innerHTML = `
+        <form class="add-task-form bg-green-50 rounded-lg p-4 mb-4 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.task.title_label')}</label>
+                <input type="text" maxlength="150" class="task-title w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required placeholder="${t('contentManager.task.title_placeholder')}">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.task.instructions_label')}</label>
+                <textarea class="task-description w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" rows="3" placeholder="${t('contentManager.task.instructions_placeholder')}"></textarea>
+                ${bilingualToggleHTML(scopeId('add-task-en-fields', folderId), `
+                    <input type="text" maxlength="150" class="task-title-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_title_label')}">
+                    <textarea class="task-description-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" rows="3" placeholder="${t('common.english_text_label')}"></textarea>
+                `)}
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.task.file_label')}</label>
+                <input type="file" class="task-file w-full text-sm" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip,.rar">
+                <p class="text-xs text-gray-500 mt-1">${t('contentManager.task.formats_hint')}</p>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.task.weight_label')}</label>
+                <input type="number" class="task-weight w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" min="0" max="100" step="0.01" placeholder="${t('contentManager.task.weight_placeholder')}">
+                <p class="text-xs text-gray-500 mt-1">${t('contentManager.task.weight_hint')}</p>
+            </div>
+            <div class="flex gap-2">
+                <button type="submit" class="submit-task-btn bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-check mr-1"></i> ${t('contentManager.task.submit')}
+                </button>
+                <button type="button" onclick="document.getElementById('${scopeId('add-task-form-container', folderId)}').innerHTML = ''" class="border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">
+                    ${t('contentManager.cancel')}
+                </button>
+            </div>
+        </form>
+    `;
+
+    container.querySelector('.add-task-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = e.target.querySelector('.task-title').value.trim();
+        const description = e.target.querySelector('.task-description').value.trim();
+        const titleEn = e.target.querySelector('.task-title-en').value.trim();
+        const descriptionEn = e.target.querySelector('.task-description-en').value.trim();
+        const file = e.target.querySelector('.task-file').files[0];
+        const weight = e.target.querySelector('.task-weight').value.trim();
+        const submitBtn = e.target.querySelector('.submit-task-btn');
+
+        if (!title) {
+            showToast(t('contentManager.title_required'), 'error');
+            return;
+        }
+        // El archivo de instrucciones es opcional en una tarea (a
+        // diferencia de video/archivo/imagen) — solo se chequea el
+        // tamaño si efectivamente se adjuntó uno.
+        if (file && !checkFileSize(file, MAX_DOC_BYTES, t('contentManager.task.field_label'))) return;
+
+        const formData = new FormData();
+        formData.append('course_id', courseId);
+        formData.append('title', title);
+        formData.append('description', description);
+        formData.append('title_en', titleEn);
+        formData.append('description_en', descriptionEn);
+        if (file) {
+            formData.append('file', file);
+        }
+        if (weight) formData.append('weight_percent', weight);
+        if (folderId) formData.append('folder_id', folderId);
+
+        await submitContentForm(submitBtn, {
+            loadingLabel: t('contentManager.saving'),
+            idleLabel: `<i class="fas fa-check mr-1"></i> ${t('contentManager.task.submit')}`,
+            apiCall: () => contentsAPI.createTask(formData),
+            successMessage: t('contentManager.task.added'),
+            errorMessage: t('contentManager.task.add_failed')
+        });
+    });
+}
+
+// =================================
+// Formulario para CUESTIONARIO o ENCUESTA (crear y editar preguntas)
+// Comparten el mismo formulario dinámico: el tipo de pregunta se elige una
+// sola vez para todo el cuestionario/encuesta (no se mezcla por pregunta),
+// y la única diferencia visual es que una encuesta no muestra el radio de
+// "marcar como correcta" (no tiene sentido, no hay respuesta correcta).
+// `renderQuestionForm` es compartido entre crear (showAddQuizForm/
+// showAddSurveyForm más abajo) y editar (editQuestionContentHandler, ver
+// sección "Editar contenido existente") — la única diferencia real es si
+// arranca vacío o precargado con datos existentes, y a qué endpoint apunta
+// el submit (eso lo decide quien llama, vía `apiCall`).
+// =================================
+
+function getQuestionTypeOptions() {
+    return [
+        { value: 'multiple_choice', label: t('contentManager.quiz.type_multiple_choice') },
+        { value: 'true_false', label: t('contentManager.quiz.type_true_false') },
+        { value: 'short_answer', label: t('contentManager.quiz.type_short_answer') }
+    ];
+}
+
+// El tipo de pregunta se elige por pregunta, no una sola vez para todo el
+// cuestionario/encuesta — cada fila puede ser de un tipo distinto (ej. una
+// opción múltiple, otra verdadero/falso, otra respuesta corta).
+function blankOptionsForType(questionType) {
+    if (questionType === 'true_false') {
+        return [{ text: t('contentManager.quiz.option_true'), is_correct: true }, { text: t('contentManager.quiz.option_false'), is_correct: false }];
+    }
+    if (questionType === 'multiple_choice') {
+        return [{ text: '', is_correct: true }, { text: '', is_correct: false }];
+    }
+    return null; // short_answer no lleva opciones
+}
+
+function renderQuestionForm(container, {
+    kind,
+    initialTitle = '',
+    initialDescription = '',
+    initialTitleEn = '',
+    initialDescriptionEn = '',
+    initialQuestions = null,
+    initialWeightPercent = null,
+    idleLabel,
+    apiCall,
+    successMessage,
+    errorMessage,
+    onCancel
+}) {
+    const isQuiz = kind === 'quiz';
+
+    let questions = (initialQuestions && initialQuestions.length > 0)
+        ? initialQuestions
+        : [{ text: '', text_en: '', question_type: 'multiple_choice', options: blankOptionsForType('multiple_choice'), points: 1, attachment_type: null, attachment_url: null, attachmentFile: null }];
+
+    // Vista previa de un adjunto recién elegido (imagen/video): un mismo
+    // File se re-renderiza muchas veces mientras el profesor sigue editando
+    // otras preguntas — cachear por File evita pedirle al navegador una URL
+    // de blob nueva en cada rerender() para el mismo archivo sin cambios.
+    const attachmentPreviewUrls = new WeakMap();
+    function attachmentPreviewUrl(file) {
+        if (!attachmentPreviewUrls.has(file)) {
+            attachmentPreviewUrls.set(file, URL.createObjectURL(file));
+        }
+        return attachmentPreviewUrls.get(file);
+    }
+
+    // Lee el estado ACTUAL desde el DOM (no desde `questions`) antes de
+    // cualquier re-render estructural (agregar/quitar pregunta u opción,
+    // cambiar el tipo) — así no se pierde lo que el profesor ya escribió.
+    // `attachmentFile` es la excepción: un <input type="file"> no se puede
+    // releer de otra forma que `.files`, y rerender() lo restaura ahí mismo
+    // (ver más abajo) — por eso se conserva por índice desde el `questions`
+    // viejo (mismo orden que las filas del DOM en este punto, antes de
+    // cualquier splice/push) en vez de leerse de un campo de texto.
+    function readCurrentQuestions() {
+        return Array.from(listEl.querySelectorAll('.question-row')).map((row, i) => {
+            const text = row.querySelector('.question-text').value;
+            const textEnInput = row.querySelector('.question-text-en');
+            const text_en = textEnInput ? textEnInput.value : '';
+            const question_type = row.querySelector('.question-type-select').value;
+            const pointsInput = row.querySelector('.question-points');
+            const points = pointsInput ? Math.max(1, parseInt(pointsInput.value, 10) || 1) : 1;
+            const optionRows = row.querySelectorAll('.option-row');
+            // Las traducciones de opción (.option-text-en) viven dentro del
+            // mismo panel "Agregar en otro idioma" que la pregunta, no una
+            // por fila de opción — se emparejan por posición (data-o-index),
+            // en el mismo orden en que questionRowHTML las generó.
+            const optionEnInputs = Array.from(row.querySelectorAll('.option-text-en'));
+            const options = optionRows.length === 0 ? null : Array.from(optionRows).map((optRow, oIndex) => {
+                const textInput = optRow.querySelector('.option-text');
+                const radio = optRow.querySelector('.option-correct-radio');
+                const enInput = optionEnInputs.find((el) => Number(el.dataset.oIndex) === oIndex);
+                return {
+                    text: textInput ? textInput.value : optRow.dataset.fixedText,
+                    text_en: enInput ? enInput.value : '',
+                    is_correct: radio ? radio.checked : false
+                };
+            });
+
+            const attachmentTypeSelect = row.querySelector('.question-attachment-type-select');
+            const attachment_type = attachmentTypeSelect ? (attachmentTypeSelect.value || null) : null;
+            let attachment_url = null;
+            let attachmentFile = null;
+            if (attachment_type === 'url') {
+                const urlInput = row.querySelector('.question-attachment-url-input');
+                attachment_url = urlInput ? urlInput.value : '';
+            } else if (attachment_type === 'image' || attachment_type === 'video') {
+                const fileInput = row.querySelector('.question-attachment-file');
+                const newFile = fileInput && fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+                attachment_url = questions[i] ? questions[i].attachment_url : null;
+                attachmentFile = newFile || (questions[i] ? questions[i].attachmentFile : null);
+            }
+
+            return { text, text_en, question_type, options, points, attachment_type, attachment_url, attachmentFile };
+        });
+    }
+
+    function optionRowHTML(opt, qIndex, oIndex, options, questionType) {
+        const isTrueFalse = questionType === 'true_false';
+        return `
+            <div class="option-row flex items-center gap-2" ${isTrueFalse ? `data-fixed-text="${escapeAttr(opt.text)}"` : ''}>
+                ${isQuiz ? `<input type="radio" name="correct-${qIndex}" class="option-correct-radio" aria-label="${escapeAttr(t('contentManager.quiz.correct_option_aria', { o: oIndex + 1, q: qIndex + 1 }))}" ${opt.is_correct ? 'checked' : ''}>` : ''}
+                ${isTrueFalse
+                    ? `<span class="text-sm text-gray-700 flex-1">${escapeHtml(opt.text)}</span>`
+                    : `<input type="text" maxlength="500" aria-label="${escapeAttr(t('contentManager.quiz.option_aria', { o: oIndex + 1, q: qIndex + 1 }))}" class="option-text flex-1 px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('contentManager.quiz.option_placeholder', { n: oIndex + 1 })}" value="${escapeAttr(opt.text)}">`
+                }
+                ${!isTrueFalse && options.length > 2 ? `
+                    <button type="button" class="remove-option-btn text-gray-400 hover:text-red-500 px-1" title="${t('contentManager.quiz.remove_option_title')}" aria-label="${t('contentManager.quiz.remove_option_title')}">
+                        <i class="fas fa-times"></i>
+                    </button>
+                ` : ''}
+            </div>
+        `;
+    }
+
+    // Vista previa del adjunto ANTES de guardar — mismo pedido que ya
+    // resolvían setupThumbnailDropZone/preview de miniatura de curso en
+    // otras partes del admin. Imagen/video usan un File recién elegido
+    // (URL.createObjectURL, cacheada por attachmentPreviewUrl) o, al
+    // editar sin tocar el adjunto, la URL real ya guardada en el server.
+    // El caso 'url' es un contenedor vacío nada más — se llena embebido
+    // (mismo mecanismo que showAddUrlForm) desde rerender() y desde el
+    // listener de 'input' de más abajo, no acá: esta función solo arma el
+    // HTML inicial, y un <iframe>/reproductor de YouTube no sobrevive un
+    // dangerouslySetInnerHTML-style reemplazo sin perder su estado.
+    function questionAttachmentPreviewHTML(q, qIndex) {
+        if (q.attachment_type === 'image') {
+            const src = q.attachmentFile ? attachmentPreviewUrl(q.attachmentFile) : q.attachment_url;
+            return src ? `<img src="${escapeAttr(src)}" alt="" class="max-h-40 rounded-lg border border-gray-200">` : '';
+        }
+        if (q.attachment_type === 'video') {
+            const src = q.attachmentFile ? attachmentPreviewUrl(q.attachmentFile) : q.attachment_url;
+            return src ? `<video src="${escapeAttr(src)}" controls class="max-h-40 rounded-lg border border-gray-200"></video>` : '';
+        }
+        if (q.attachment_type === 'url') {
+            return `<div class="question-url-preview" data-q-index="${qIndex}"></div>`;
+        }
+        return '';
+    }
+
+    // Embebe (YouTube/Vimeo, misma API oficial que showAddUrlForm y la
+    // vista del estudiante) o deja un link simple si el proveedor no se
+    // reconoce — compartida entre el llenado inicial (rerender) y la
+    // previsualización en vivo mientras se escribe (ver más abajo).
+    function renderUrlAttachmentPreview(container, url, qIndex) {
+        if (!url) {
+            container.innerHTML = '';
+            return;
+        }
+        const youtubeId = getYoutubeVideoId(url);
+        const vimeoUrl = !youtubeId ? getVimeoEmbedUrl(url) : null;
+        const embedId = `question-yt-embed-${qIndex}`;
+
+        if (youtubeId) {
+            container.innerHTML = `
+                <div data-embed-wrapper>
+                    <div class="video-player-container mt-2">
+                        <div id="${embedId}"></div>
+                    </div>
+                    <div data-embed-fallback class="hidden text-sm text-gray-500 bg-gray-50 rounded-lg p-3 mt-2">
+                        <i class="fas fa-triangle-exclamation text-yellow-500 mr-1"></i>
+                        ${t('contentManager.url.preview_failed')}
+                    </div>
+                </div>
+            `;
+            createYoutubeEmbed(embedId, youtubeId);
+        } else if (vimeoUrl) {
+            container.innerHTML = `<div class="video-player-container mt-2"><iframe src="${vimeoUrl}" frameborder="0" allowfullscreen></iframe></div>`;
+        } else {
+            container.innerHTML = `<a href="${escapeAttr(url)}" target="_blank" rel="noopener" class="text-xs text-cenat-green hover:underline">${escapeHtml(url)}</a>`;
+        }
+    }
+
+    function questionRowHTML(q, qIndex) {
+        const questionType = q.question_type;
+        const showOptions = questionType !== 'short_answer';
+        return `
+            <div class="question-row bg-white/70 border border-green-200 rounded-lg p-3 space-y-2" data-q-index="${qIndex}">
+                <div class="flex items-start gap-2 flex-wrap">
+                    <span class="text-sm font-semibold text-gray-500 mt-2">${qIndex + 1}.</span>
+                    <input type="text" aria-label="${escapeAttr(t('contentManager.quiz.question_aria', { n: qIndex + 1 }))}" class="question-text flex-1 min-w-[10rem] px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('contentManager.quiz.question_placeholder')}" value="${escapeAttr(q.text || '')}">
+                    <select class="question-type-select px-2 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" title="${t('contentManager.quiz.question_type_title')}">
+                        ${getQuestionTypeOptions().map((opt) => `<option value="${opt.value}" ${questionType === opt.value ? 'selected' : ''}>${opt.label}</option>`).join('')}
+                    </select>
+                    ${isQuiz ? `
+                        <input type="number" class="question-points w-16 px-2 py-2 border border-gray-300 rounded-lg text-sm text-center focus:outline-none focus:ring-2 focus:ring-cenat-green" min="1" step="1" title="${t('contentManager.quiz.points_title')}" value="${q.points || 1}">
+                    ` : ''}
+                    <button type="button" class="remove-question-btn text-red-500 hover:text-red-700 px-2 mt-1" title="${t('contentManager.quiz.remove_question_title')}" aria-label="${t('contentManager.quiz.remove_question_title')}">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+                <div class="pl-6">
+                    ${bilingualToggleHTML(`question-${qIndex}-en-fields`, `
+                        <input type="text" class="question-text-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_text_label')}" value="${escapeAttr(q.text_en || '')}">
+                        ${showOptions && questionType === 'multiple_choice' ? (q.options || []).map((opt, oIndex) => `
+                            <input type="text" maxlength="500" class="option-text-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" data-o-index="${oIndex}" placeholder="${t('contentManager.quiz.option_placeholder', { n: oIndex + 1 })} (EN)" value="${escapeAttr(opt.text_en || '')}">
+                        `).join('') : ''}
+                    `, !!(q.text_en || (showOptions && questionType === 'multiple_choice' && (q.options || []).some((opt) => opt.text_en))))}
+                </div>
+                ${showOptions ? `
+                    <div class="pl-6 space-y-1">
+                        ${(q.options || []).map((opt, oIndex) => optionRowHTML(opt, qIndex, oIndex, q.options, questionType)).join('')}
+                        ${questionType === 'multiple_choice' ? `
+                            <button type="button" class="add-option-btn text-xs text-cenat-green hover:underline mt-1">
+                                <i class="fas fa-plus mr-1"></i> ${t('contentManager.quiz.add_option')}
+                            </button>
+                        ` : ''}
+                    </div>
+                ` : ''}
+                <div class="pl-6 pt-1 border-t border-gray-100 space-y-2">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <label class="text-xs text-gray-600">${t('contentManager.quiz.attachment_label')}</label>
+                        <select class="question-attachment-type-select px-2 py-1 border border-gray-300 rounded text-xs focus:outline-none focus:ring-2 focus:ring-cenat-green">
+                            <option value="" ${!q.attachment_type ? 'selected' : ''}>${t('contentManager.quiz.attachment_none')}</option>
+                            <option value="image" ${q.attachment_type === 'image' ? 'selected' : ''}>${t('contentManager.quiz.attachment_image')}</option>
+                            <option value="video" ${q.attachment_type === 'video' ? 'selected' : ''}>${t('contentManager.quiz.attachment_video')}</option>
+                            <option value="url" ${q.attachment_type === 'url' ? 'selected' : ''}>${t('contentManager.quiz.attachment_url')}</option>
+                        </select>
+                        ${(q.attachment_type === 'image' || q.attachment_type === 'video') ? `
+                            <input type="file" class="question-attachment-file text-xs" accept="${q.attachment_type === 'image' ? 'image/jpeg,image/png,image/gif,image/webp' : 'video/mp4,video/x-msvideo,video/quicktime,video/x-ms-wmv,video/x-flv,video/x-matroska,video/webm'}" aria-label="${escapeAttr(t('contentManager.quiz.attachment_file_aria', { n: qIndex + 1 }))}">
+                            ${q.attachmentFile ? `<span class="text-xs text-gray-500">${escapeHtml(q.attachmentFile.name)}</span>` : ''}
+                        ` : ''}
+                        ${q.attachment_type === 'url' ? `
+                            <input type="text" class="question-attachment-url-input flex-1 min-w-[10rem] px-2 py-1 border border-gray-300 rounded text-xs focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="https://..." value="${escapeAttr(q.attachment_url || '')}" aria-label="${escapeAttr(t('contentManager.quiz.attachment_url_aria', { n: qIndex + 1 }))}">
+                        ` : ''}
+                    </div>
+                    ${questionAttachmentPreviewHTML(q, qIndex)}
+                </div>
+            </div>
+        `;
+    }
+
+    // Un <input type="file"> pierde su selección al regenerar el HTML de su
+    // fila (innerHTML) — se restaura con la API de DataTransfer sobre el
+    // nuevo elemento, único mecanismo permitido por el navegador para
+    // asignarle una selección de archivo por script.
+    function rerender() {
+        listEl.innerHTML = questions.map(questionRowHTML).join('');
+        questions.forEach((q, i) => {
+            const row = listEl.children[i];
+            if (!row) return;
+
+            if (q.attachmentFile) {
+                const fileInput = row.querySelector('.question-attachment-file');
+                if (fileInput) {
+                    const dt = new DataTransfer();
+                    dt.items.add(q.attachmentFile);
+                    fileInput.files = dt.files;
+                }
+            }
+
+            if (q.attachment_type === 'url' && (q.attachment_url || '').trim()) {
+                const previewContainer = row.querySelector('.question-url-preview');
+                if (previewContainer) renderUrlAttachmentPreview(previewContainer, q.attachment_url.trim(), i);
+            }
+        });
+    }
+
+    container.innerHTML = `
+        <form class="question-content-form bg-green-50 rounded-lg p-4 mb-4 space-y-3">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t(isQuiz ? 'contentManager.quiz.title_label_quiz' : 'contentManager.quiz.title_label_survey')}</label>
+                <input type="text" maxlength="150" class="quiz-title w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required placeholder="${t(isQuiz ? 'contentManager.quiz.title_placeholder_quiz' : 'contentManager.quiz.title_placeholder_survey')}" value="${escapeAttr(initialTitle)}">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.quiz.description_label')}</label>
+                <input type="text" class="quiz-description w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" value="${escapeAttr(initialDescription)}">
+                ${bilingualToggleHTML('quiz-header-en-fields', `
+                    <input type="text" maxlength="150" class="quiz-title-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_title_label')}" value="${escapeAttr(initialTitleEn)}">
+                    <input type="text" class="quiz-description-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_description_label')}" value="${escapeAttr(initialDescriptionEn)}">
+                `, !!(initialTitleEn || initialDescriptionEn))}
+            </div>
+            ${isQuiz ? `
+                <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.quiz.weight_label')}</label>
+                    <input type="number" class="quiz-weight w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" min="0" max="100" step="0.01" placeholder="${t('contentManager.quiz.weight_placeholder')}" value="${initialWeightPercent ?? ''}">
+                    <p class="text-xs text-gray-500 mt-1">${t('contentManager.quiz.weight_hint')}</p>
+                </div>
+            ` : ''}
+            <div class="questions-list space-y-3"></div>
+            <button type="button" class="add-question-btn text-sm text-cenat-green hover:underline">
+                <i class="fas fa-plus mr-1"></i> ${t('contentManager.quiz.add_question')}
+            </button>
+            <div class="flex gap-2 pt-2 border-t border-green-100">
+                <button type="submit" class="submit-quiz-btn bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    ${idleLabel}
+                </button>
+                <button type="button" class="cancel-quiz-btn border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">${t('contentManager.cancel')}</button>
+            </div>
+        </form>
+    `;
+
+    const formEl = container.querySelector('form');
+    const listEl = formEl.querySelector('.questions-list');
+
+    rerender();
+
+    formEl.querySelector('.cancel-quiz-btn').addEventListener('click', onCancel);
+
+    formEl.querySelector('.add-question-btn').addEventListener('click', () => {
+        questions = readCurrentQuestions();
+        questions.push({ text: '', text_en: '', question_type: 'multiple_choice', options: blankOptionsForType('multiple_choice'), points: 1, attachment_type: null, attachment_url: null, attachmentFile: null });
+        rerender();
+    });
+
+    // Cambiar el tipo de UNA pregunta reinicia solo sus opciones (el resto
+    // de preguntas del formulario no se toca) — delegado en listEl por el
+    // mismo motivo que el resto de listeners de esta lista.
+    listEl.addEventListener('change', (e) => {
+        const typeSelect = e.target.closest('.question-type-select');
+        if (typeSelect) {
+            questions = readCurrentQuestions();
+            const qIndex = Number(typeSelect.closest('.question-row').dataset.qIndex);
+            questions[qIndex].question_type = typeSelect.value;
+            questions[qIndex].options = blankOptionsForType(typeSelect.value);
+            rerender();
+            return;
+        }
+
+        // Cambiar el tipo de ADJUNTO de una pregunta descarta el archivo/URL
+        // que tuviera (mismo criterio que cambiar el tipo de pregunta con
+        // las opciones) — evita mandar, por ejemplo, un attachment_url de
+        // imagen vieja junto con un tipo nuevo "video".
+        const attachmentTypeSelect = e.target.closest('.question-attachment-type-select');
+        if (attachmentTypeSelect) {
+            questions = readCurrentQuestions();
+            const qIndex = Number(attachmentTypeSelect.closest('.question-row').dataset.qIndex);
+            questions[qIndex].attachment_type = attachmentTypeSelect.value || null;
+            questions[qIndex].attachment_url = null;
+            questions[qIndex].attachmentFile = null;
+            rerender();
+            return;
+        }
+
+        // Elegir un archivo nuevo: solo refresca el nombre mostrado y la
+        // rehidratación de rerender() (ver más arriba) — readCurrentQuestions
+        // ya lo toma del propio <input type="file">.
+        const attachmentFileInput = e.target.closest('.question-attachment-file');
+        if (attachmentFileInput) {
+            questions = readCurrentQuestions();
+            rerender();
+        }
+    });
+
+    // Previsualización en vivo de un adjunto tipo URL mientras se escribe
+    // — mismo patrón que showAddUrlForm (debounce + actualizar SOLO el
+    // contenedor de preview, directo por DOM). A propósito NO pasa por
+    // readCurrentQuestions()+rerender() como el resto de los campos: eso
+    // reemplazaría el <input> por uno nuevo en cada tecla y le haría
+    // perder el foco a mitad de escritura.
+    const debouncedUrlPreview = debounce((input) => {
+        const row = input.closest('.question-row');
+        const previewContainer = row && row.querySelector('.question-url-preview');
+        if (!previewContainer) return;
+        renderUrlAttachmentPreview(previewContainer, input.value.trim(), Number(row.dataset.qIndex));
+    }, 400);
+    listEl.addEventListener('input', (e) => {
+        const urlInput = e.target.closest('.question-attachment-url-input');
+        if (urlInput) debouncedUrlPreview(urlInput);
+    });
+
+    // Delegado en listEl (no en cada fila): sigue funcionando después de
+    // cada rerender() sin tener que re-enganchar listeners a mano.
+    listEl.addEventListener('click', (e) => {
+        const removeQBtn = e.target.closest('.remove-question-btn');
+        if (removeQBtn) {
+            questions = readCurrentQuestions();
+            if (questions.length <= 1) {
+                showToast(t('contentManager.quiz.at_least_one_question'), 'warning');
+                return;
+            }
+            const qIndex = Number(removeQBtn.closest('.question-row').dataset.qIndex);
+            questions.splice(qIndex, 1);
+            rerender();
+            return;
+        }
+
+        const addOptBtn = e.target.closest('.add-option-btn');
+        if (addOptBtn) {
+            questions = readCurrentQuestions();
+            const qIndex = Number(addOptBtn.closest('.question-row').dataset.qIndex);
+            questions[qIndex].options.push({ text: '', is_correct: false });
+            rerender();
+            return;
+        }
+
+        const removeOptBtn = e.target.closest('.remove-option-btn');
+        if (removeOptBtn) {
+            questions = readCurrentQuestions();
+            const row = removeOptBtn.closest('.question-row');
+            const qIndex = Number(row.dataset.qIndex);
+            const oIndex = Array.from(row.querySelectorAll('.option-row')).indexOf(removeOptBtn.closest('.option-row'));
+            questions[qIndex].options.splice(oIndex, 1);
+            if (isQuiz && !questions[qIndex].options.some((o) => o.is_correct)) {
+                questions[qIndex].options[0].is_correct = true;
+            }
+            rerender();
+        }
+    });
+
+    formEl.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        const title = formEl.querySelector('.quiz-title').value.trim();
+        const description = formEl.querySelector('.quiz-description').value.trim();
+        const titleEn = formEl.querySelector('.quiz-title-en').value.trim();
+        const descriptionEn = formEl.querySelector('.quiz-description-en').value.trim();
+        const submitBtn = formEl.querySelector('.submit-quiz-btn');
+        const currentQuestions = readCurrentQuestions();
+
+        if (!title) {
+            showToast(t('contentManager.title_required'), 'error');
+            return;
+        }
+        if (currentQuestions.some((q) => !q.text.trim())) {
+            showToast(t('contentManager.quiz.all_questions_need_text'), 'error');
+            return;
+        }
+        const withOptions = currentQuestions.filter((q) => q.question_type !== 'short_answer');
+        if (withOptions.some((q) => (q.options || []).some((o) => !o.text.trim()))) {
+            showToast(t('contentManager.quiz.all_options_need_text'), 'error');
+            return;
+        }
+        if (isQuiz && withOptions.some((q) => !(q.options || []).some((o) => o.is_correct))) {
+            showToast(t('contentManager.quiz.mark_correct_option'), 'error');
+            return;
+        }
+        if (currentQuestions.some((q) => (q.attachment_type === 'image' || q.attachment_type === 'video') && !q.attachmentFile && !q.attachment_url)) {
+            showToast(t('contentManager.quiz.attachment_file_required'), 'error');
+            return;
+        }
+        if (currentQuestions.some((q) => q.attachment_type === 'url' && !(q.attachment_url || '').trim())) {
+            showToast(t('contentManager.quiz.attachment_url_required'), 'error');
+            return;
+        }
+
+        const weightInput = formEl.querySelector('.quiz-weight');
+        // FormData (no JSON puro): una pregunta puede traer su propio
+        // archivo adjunto (ver resolveQuestionAttachments en
+        // quiz.controller.js), así que `questions` viaja como JSON-string
+        // dentro del multipart y cada archivo como un campo aparte
+        // `question_attachment_<índice>`, emparejado por posición.
+        const formData = new FormData();
+        formData.append('title', title);
+        formData.append('description', description);
+        formData.append('title_en', titleEn);
+        formData.append('description_en', descriptionEn);
+        if (isQuiz && weightInput && weightInput.value.trim()) {
+            formData.append('weight_percent', weightInput.value.trim());
+        }
+        const questionsPayload = currentQuestions.map((q) => ({
+            text: q.text.trim(),
+            text_en: (q.text_en || '').trim() || undefined,
+            question_type: q.question_type,
+            points: isQuiz ? (q.points || 1) : 1,
+            options: q.question_type === 'short_answer'
+                ? undefined
+                : q.options.map((o) => ({ text: o.text.trim(), text_en: (o.text_en || '').trim() || undefined, is_correct: !!o.is_correct })),
+            attachment_type: q.attachment_type || undefined,
+            attachment_url: q.attachment_type ? (q.attachment_url || undefined) : undefined
+        }));
+        currentQuestions.forEach((q, i) => {
+            if (q.attachmentFile) formData.append(`question_attachment_${i}`, q.attachmentFile);
+        });
+        formData.append('questions', JSON.stringify(questionsPayload));
+
+        await submitContentForm(submitBtn, {
+            loadingLabel: t('contentManager.saving'),
+            idleLabel,
+            apiCall: () => apiCall(formData),
+            successMessage,
+            errorMessage
+        });
+    });
+}
+
+function showAddQuestionForm(courseId, folderId, kind) {
+    const isQuiz = kind === 'quiz';
+    const create = isQuiz ? contentsAPI.createQuiz : contentsAPI.createSurvey;
+    const container = document.getElementById(scopeId(`add-${kind}-form-container`, folderId));
+
+    renderQuestionForm(container, {
+        kind,
+        idleLabel: `<i class="fas fa-check mr-1"></i> ${t(isQuiz ? 'contentManager.quiz.save_quiz' : 'contentManager.quiz.save_survey')}`,
+        apiCall: (formData) => {
+            formData.append('course_id', courseId);
+            if (folderId) formData.append('folder_id', folderId);
+            return create(formData);
+        },
+        successMessage: t(isQuiz ? 'contentManager.quiz.added_quiz' : 'contentManager.quiz.added_survey'),
+        errorMessage: t(isQuiz ? 'contentManager.quiz.add_failed_quiz' : 'contentManager.quiz.add_failed_survey'),
+        onCancel: () => { container.innerHTML = ''; }
+    });
+}
+
+function showAddQuizForm(courseId, folderId) {
+    showAddQuestionForm(courseId, folderId, 'quiz');
+}
+
+function showAddSurveyForm(courseId, folderId) {
+    showAddQuestionForm(courseId, folderId, 'survey');
+}
+
+// =================================
+// Editar contenido existente (sin borrar y recrear)
+// =================================
+// Mismo par content-display-{id}/content-edit-{id} para cualquier tipo
+// (ver renderDraggableItem/renderDraggableFolderItem): editar oculta la
+// fila normal y muestra el formulario en su lugar; cancelar o guardar la
+// vuelve a mostrar (guardar además dispara un re-render completo del
+// panel vía contentManagerRerender, que ya refresca todo).
+
+/**
+ * Los datos del contenido salen del propio DOM (data-content-json en el
+ * .draggable-item, ver encodeDataAttr) — no hace falta pedirlos de nuevo
+ * al servidor, ya llegaron con el resto del contenido del curso. Un quiz/
+ * survey es la excepción (ver editQuestionContentHandler): sus preguntas
+ * no viajan en esa fila, hay que pedirlas aparte.
+ */
+function editContentHandler(id) {
+    const row = document.querySelector(`.draggable-item[data-content-id="${id}"]`);
+    if (!row) return;
+    const content = JSON.parse(row.dataset.contentJson);
+
+    const display = document.getElementById(`content-display-${id}`);
+    const editContainer = document.getElementById(`content-edit-${id}`);
+    if (!display || !editContainer) return;
+
+    if (['quiz', 'survey'].includes(content.type)) {
+        editQuestionContentHandler(content, display, editContainer);
+        return;
+    }
+
+    display.classList.add('hidden');
+    editContainer.innerHTML = renderEditForm(content);
+
+    const form = editContainer.querySelector('.edit-content-form');
+    form.addEventListener('submit', (e) => submitEditContent(e, content));
+    form.querySelector('.cancel-edit-btn').addEventListener('click', () => cancelEditContent(id));
+}
+
+/**
+ * Editar un quiz/survey pide primero las preguntas actuales al servidor
+ * (con is_correct, y el conteo de respondentes) — eso no viene en
+ * data-content-json. Si ya hay respuestas, se cae al formulario simple de
+ * título/descripción (con el aviso de por qué no se puede tocar la
+ * estructura); si nadie respondió todavía, se ofrece el editor completo de
+ * preguntas (mismo formulario que crear, precargado con lo existente).
+ */
+async function editQuestionContentHandler(content, display, editContainer) {
+    editContainer.innerHTML = `<p class="text-xs text-gray-400 mt-2 px-1">${t('contentManager.quiz.loading_questions')}</p>`;
+
+    let data;
+    try {
+        ({ data } = await contentsAPI.getQuestionsForManage(content.id));
+    } catch (error) {
+        editContainer.innerHTML = '';
+        showToast(error.message || t('contentManager.quiz.load_questions_failed'), 'error');
+        return;
+    }
+
+    display.classList.add('hidden');
+
+    if (data.respondent_count > 0) {
+        editContainer.innerHTML = renderEditForm(content, data.respondent_count);
+        const form = editContainer.querySelector('.edit-content-form');
+        form.addEventListener('submit', (e) => submitEditContent(e, content));
+        form.querySelector('.cancel-edit-btn').addEventListener('click', () => cancelEditContent(content.id));
+        return;
+    }
+
+    const isQuiz = content.type === 'quiz';
+    renderQuestionForm(editContainer, {
+        kind: content.type,
+        initialTitle: content.title,
+        initialDescription: content.description || '',
+        initialTitleEn: content.title_en || '',
+        initialDescriptionEn: content.description_en || '',
+        initialWeightPercent: data.weight_percent,
+        initialQuestions: data.questions.map((q) => ({
+            text: q.question_text,
+            text_en: q.question_text_en || '',
+            question_type: q.question_type,
+            points: q.points || 1,
+            options: (q.options || []).length > 0
+                ? q.options.map((o) => ({ text: o.option_text, text_en: o.option_text_en || '', is_correct: !!o.is_correct }))
+                : null,
+            attachment_type: q.attachment_type || null,
+            attachment_url: q.attachment_url || null,
+            attachmentFile: null
+        })),
+        idleLabel: `<i class="fas fa-check mr-1"></i> ${t('contentManager.save')}`,
+        apiCall: (formData) => contentsAPI.updateQuestions(content.id, formData),
+        successMessage: t(isQuiz ? 'contentManager.quiz.updated_quiz' : 'contentManager.quiz.updated_survey'),
+        errorMessage: t(isQuiz ? 'contentManager.quiz.update_failed_quiz' : 'contentManager.quiz.update_failed_survey'),
+        onCancel: () => cancelEditContent(content.id)
+    });
+}
+
+function cancelEditContent(id) {
+    const editContainer = document.getElementById(`content-edit-${id}`);
+    if (editContainer) editContainer.innerHTML = '';
+    const display = document.getElementById(`content-display-${id}`);
+    if (display) display.classList.remove('hidden');
+}
+
+/**
+ * Campos según el tipo — todos comparten título; el resto varía porque
+ * cada tipo guarda su "contenido real" en un lugar distinto (texto/foro en
+ * description, url en url, video/imagen/archivo/tarea en un archivo que
+ * se puede reemplazar opcionalmente). Un cuestionario/encuesta solo llega
+ * acá cuando ya tiene respuestas (ver editQuestionContentHandler) — sin
+ * respuestas se usa el editor completo de preguntas (renderQuestionForm),
+ * y con respuestas cambiar la estructura implicaría borrarlas.
+ */
+function renderEditForm(content, respondentCount = 0) {
+    const titleField = `
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.edit.title_label')}</label>
+            <input type="text" maxlength="150" class="edit-title w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required value="${escapeAttr(content.title)}">
+            ${bilingualToggleHTML(`edit-title-en-fields-${content.id}`, `
+                <input type="text" maxlength="150" class="edit-title-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_title_label')}" value="${escapeAttr(content.title_en || '')}">
+            `, !!content.title_en)}
+        </div>
+    `;
+
+    const descriptionField = (label, required = false, rows = null) => `
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">${label}</label>
+            ${rows
+                ? `<textarea class="edit-description w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" rows="${rows}" ${required ? 'required' : ''}>${escapeHtml(content.description || '')}</textarea>`
+                : `<input type="text" class="edit-description w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" ${required ? 'required' : ''} value="${escapeAttr(content.description || '')}">`
+            }
+            ${bilingualToggleHTML(`edit-description-en-fields-${content.id}`, rows
+                ? `<textarea class="edit-description-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" rows="${rows}" placeholder="${t('common.english_text_label')}">${escapeHtml(content.description_en || '')}</textarea>`
+                : `<input type="text" class="edit-description-en w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" placeholder="${t('common.english_description_label')}" value="${escapeAttr(content.description_en || '')}">`
+            , !!content.description_en)}
+        </div>
+    `;
+
+    const fileField = (label, accept, hint) => `
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">${label}</label>
+            <input type="file" class="edit-file w-full text-sm" accept="${accept}">
+            <p class="text-xs text-gray-500 mt-1">${hint} — ${t('contentManager.videos.keep_unchanged_hint')}</p>
+        </div>
+    `;
+
+    const weightField = () => `
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.edit.weight_label')}</label>
+            <input type="number" class="edit-weight w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" min="0" max="100" step="0.01" placeholder="${t('contentManager.edit.weight_placeholder')}" value="${content.weight_percent ?? ''}">
+            <p class="text-xs text-gray-500 mt-1">${t('contentManager.edit.weight_hint')}</p>
+        </div>
+    `;
+
+    let body = '';
+    switch (content.type) {
+        case 'folder':
+            body = '';
+            break;
+        case 'text':
+            body = descriptionField(t('contentManager.edit.content_label'), true, 5);
+            break;
+        case 'forum':
+            body = descriptionField(t('contentManager.edit.main_text_label'), true, 4);
+            break;
+        case 'task':
+            body = descriptionField(t('contentManager.edit.instructions_label'), false, 3)
+                + fileField(t('contentManager.task.replace_file_label'), '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip,.rar', t('contentManager.task.formats_hint'))
+                + weightField();
+            break;
+        case 'url':
+            body = descriptionField(t('contentManager.edit.description_label'))
+                + `<div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">${t('contentManager.edit.url_label')}</label>
+                    <input type="url" maxlength="500" class="edit-url w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-cenat-green" required value="${escapeAttr(content.url || '')}">
+                </div>`;
+            break;
+        case 'quiz':
+        case 'survey': {
+            const isQuizType = content.type === 'quiz';
+            const noteKey = respondentCount === 1
+                ? (isQuizType ? 'contentManager.quiz.respondent_note_quiz_singular' : 'contentManager.quiz.respondent_note_survey_singular')
+                : (isQuizType ? 'contentManager.quiz.respondent_note_quiz_plural' : 'contentManager.quiz.respondent_note_survey_plural');
+            body = descriptionField(t('contentManager.edit.description_label'))
+                + (isQuizType ? weightField() : '')
+                + `<p class="text-xs text-gray-400">${t(noteKey, { count: respondentCount })}</p>`;
+            break;
+        }
+        case 'video':
+            body = descriptionField(t('contentManager.edit.description_label'))
+                + fileField(t('contentManager.videos.replace_label'), 'video/*', t('contentManager.videos.formats_hint'));
+            break;
+        case 'image':
+            body = descriptionField(t('contentManager.edit.description_label'))
+                + fileField(t('contentManager.image.replace_label'), 'image/*', t('contentManager.image.formats_hint'));
+            break;
+        case 'file':
+            body = descriptionField(t('contentManager.edit.description_label'))
+                + fileField(t('contentManager.file.replace_label'), '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.zip,.rar', t('contentManager.file.formats_hint'));
+            break;
+    }
+
+    return `
+        <form class="edit-content-form bg-green-50 rounded-lg p-4 space-y-3 mt-2">
+            ${titleField}
+            ${body}
+            <div class="flex gap-2">
+                <button type="submit" class="submit-edit-btn bg-cenat-green text-white px-4 py-2 rounded-lg text-sm font-semibold">
+                    <i class="fas fa-check mr-1"></i> ${t('contentManager.save')}
+                </button>
+                <button type="button" class="cancel-edit-btn border border-gray-300 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-200 transition">${t('contentManager.cancel')}</button>
+            </div>
+        </form>
+    `;
+}
+
+async function submitEditContent(e, content) {
+    e.preventDefault();
+    const form = e.target;
+    const submitBtn = form.querySelector('.submit-edit-btn');
+
+    const title = form.querySelector('.edit-title').value.trim();
+    if (!title) {
+        showToast(t('contentManager.title_required'), 'error');
+        return;
+    }
+    const titleEnInput = form.querySelector('.edit-title-en');
+    const titleEn = titleEnInput ? titleEnInput.value.trim() : undefined;
+
+    const descriptionInput = form.querySelector('.edit-description');
+    const description = descriptionInput ? descriptionInput.value.trim() : undefined;
+    if (descriptionInput && descriptionInput.required && !description) {
+        showToast(t('contentManager.field_required'), 'error');
+        return;
+    }
+    const descriptionEnInput = form.querySelector('.edit-description-en');
+    const descriptionEn = descriptionEnInput ? descriptionEnInput.value.trim() : undefined;
+
+    const urlInput = form.querySelector('.edit-url');
+    if (urlInput && !urlInput.value.trim()) {
+        showToast(t('contentManager.url.required_edit'), 'error');
+        return;
+    }
+
+    const fileInput = form.querySelector('.edit-file');
+    const file = fileInput ? fileInput.files[0] : null;
+    if (file) {
+        const maxBytes = content.type === 'video' ? MAX_VIDEO_BYTES : content.type === 'image' ? MAX_IMAGE_BYTES : MAX_DOC_BYTES;
+        if (!checkFileSize(file, maxBytes, t('contentManager.file.field_label'))) return;
+    }
+
+    const weightInput = form.querySelector('.edit-weight');
+    const weight = weightInput ? weightInput.value.trim() : undefined;
+
+    let payload;
+    if (file) {
+        payload = new FormData();
+        payload.append('title', title);
+        if (titleEnInput) payload.append('title_en', titleEn);
+        if (descriptionInput) payload.append('description', description);
+        if (descriptionEnInput) payload.append('description_en', descriptionEn);
+        if (weightInput) payload.append('weight_percent', weight);
+        if (content.type === 'video') payload.append('video', file);
+        else if (content.type === 'image') payload.append('image', file);
+        else payload.append('file', file);
+    } else {
+        payload = { title };
+        if (titleEnInput) payload.title_en = titleEn;
+        if (descriptionInput) payload.description = description;
+        if (descriptionEnInput) payload.description_en = descriptionEn;
+        if (urlInput) payload.url = urlInput.value.trim();
+        if (weightInput) payload.weight_percent = weight;
+    }
+
+    await submitContentForm(submitBtn, {
+        loadingLabel: t('contentManager.saving'),
+        idleLabel: `<i class="fas fa-check mr-1"></i> ${t('contentManager.save')}`,
+        apiCall: () => contentsAPI.update(content.id, payload),
+        successMessage: t('contentManager.content_updated'),
+        errorMessage: t('contentManager.content_update_failed')
+    });
+}
+
+function getDeleteContentTypeLabel(type) {
+    const map = {
+        video: t('contentManager.delete_type_video'),
+        file: t('contentManager.delete_type_file'),
+        image: t('contentManager.delete_type_image'),
+        text: t('contentManager.delete_type_text'),
+        url: t('contentManager.delete_type_url'),
+        task: t('contentManager.delete_type_task'),
+        quiz: t('contentManager.delete_type_quiz'),
+        survey: t('contentManager.delete_type_survey'),
+        forum: t('contentManager.delete_type_forum'),
+        folder: t('contentManager.delete_type_folder')
+    };
+    return map[type] || t('contentManager.delete_type_default');
+}
+
+async function deleteContentHandler(id, type) {
+    const label = getDeleteContentTypeLabel(type);
+    if (!(await confirmAction(t('contentManager.delete_confirm', { label })))) {
+        return;
+    }
+
+    try {
+        await contentsAPI.delete(id);
+        showToast(t('contentManager.content_deleted'), 'success');
+        contentManagerRerender();
+    } catch (error) {
+        showToast(error.message || t('contentManager.content_delete_failed'), 'error');
+    }
+}
+
+window.initCourseContentManager = initCourseContentManager;
+window.renderCourseContentManagerHTML = renderCourseContentManagerHTML;
+window.renderContentItem = renderContentItem;
+window.renderTaskItem = renderTaskItem;
+window.renderForumItem = renderForumItem;
+window.showAddFolderForm = showAddFolderForm;
+window.showAddVideoForm = showAddVideoForm;
+window.showAddFileForm = showAddFileForm;
+window.showAddImageForm = showAddImageForm;
+window.showAddTextForm = showAddTextForm;
+window.showAddUrlForm = showAddUrlForm;
+window.showAddTaskForm = showAddTaskForm;
+window.showAddQuizForm = showAddQuizForm;
+window.showAddSurveyForm = showAddSurveyForm;
+window.showAddForumForm = showAddForumForm;
+window.deleteContentHandler = deleteContentHandler;
+window.editContentHandler = editContentHandler;
+window.cancelEditContent = cancelEditContent;
+window.moveContentItem = moveContentItem;
