@@ -402,6 +402,16 @@ export const createTaskContent = async (req, res) => {
       if (req.file) await deleteFile(`/uploads/files/${req.file.filename}`);
       return res.status(400).json({ success: false, message: weightCheck.message });
     }
+    if (weightCheck.value !== null) {
+      const assigned = await Content.getAssignedWeightPercentSum(course_id);
+      if (assigned + weightCheck.value > 100) {
+        if (req.file) await deleteFile(`/uploads/files/${req.file.filename}`);
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.weight_percent_exceeds_total', { assigned, max: Math.max(0, 100 - assigned) })
+        });
+      }
+    }
 
     const folderCheck = await resolveFolderId(folder_id, course_id);
     if (!folderCheck.ok) {
@@ -589,6 +599,16 @@ export const updateContent = async (req, res) => {
       if (!weightCheck.ok) {
         if (req.file) await deleteFile(uploadedFileUrl(content.type, req.file.filename));
         return res.status(400).json({ success: false, message: weightCheck.message });
+      }
+      if (weightCheck.value !== null) {
+        const assigned = await Content.getAssignedWeightPercentSum(content.course_id, content.id);
+        if (assigned + weightCheck.value > 100) {
+          if (req.file) await deleteFile(uploadedFileUrl(content.type, req.file.filename));
+          return res.status(400).json({
+            success: false,
+            message: t(req.locale, 'errors.weight_percent_exceeds_total', { assigned, max: Math.max(0, 100 - assigned) })
+          });
+        }
       }
       updateData.weight_percent = weightCheck.value;
     }

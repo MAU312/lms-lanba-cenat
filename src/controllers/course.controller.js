@@ -743,8 +743,13 @@ export const getCourseStudents = async (req, res) => {
     // cuestionarios calificables del curso no dependen del estudiante —se
     // piden una sola vez acá en vez de una vez por cada estudiante de la
     // página (ver Content.getGradableQuizzes).
-    const quizRows = await Content.getGradableQuizzes(id);
-    const grades = await Promise.all(students.map((s) => Content.calculateCourseGrade(id, s.id, quizRows)));
+    // Igual que el progreso combinado: si `id` es el curso padre, la nota
+    // suma lo calificado en todo el grupo (padre + cursos hijo); si `id` ya
+    // es en sí un curso hijo, se queda solo con lo de ese curso puntual
+    // (mismo criterio que el override de `progress` más abajo).
+    const courseIds = course.parent_module_id ? [id] : await Course.getProgressGroupIds(id);
+    const quizRows = await Content.getGradableQuizzes(courseIds);
+    const grades = await Promise.all(students.map((s) => Content.calculateCourseGrade(courseIds, s.id, quizRows)));
     students.forEach((s, i) => { s.grade = grades[i]; });
 
     // Course.getEnrolledStudents ya resuelve la raíz y trae el `progress`
@@ -791,7 +796,11 @@ export const exportCourseGrades = async (req, res) => {
     // Los cuestionarios calificables del curso no dependen del estudiante —
     // se piden una sola vez acá en vez de una vez por cada estudiante del
     // roster completo (ver Content.getGradableQuizzes).
-    const quizRows = await Content.getGradableQuizzes(id);
+    // Mismo criterio de grupo combinado que getCourseStudents (ver su
+    // comentario) — padre+hijos si `id` es el curso padre, solo ese curso
+    // si ya es un curso hijo.
+    const courseIds = course.parent_module_id ? [id] : await Course.getProgressGroupIds(id);
+    const quizRows = await Content.getGradableQuizzes(courseIds);
     // En lotes de 25 en vez de un solo Promise.all sobre todo el roster:
     // con un curso de miles de inscritos, disparar una query por
     // estudiante toda de una vez puede agotar el pool de conexiones de
@@ -800,7 +809,7 @@ export const exportCourseGrades = async (req, res) => {
     const grades = [];
     for (let i = 0; i < students.length; i += GRADE_EXPORT_BATCH_SIZE) {
       const batch = students.slice(i, i + GRADE_EXPORT_BATCH_SIZE);
-      grades.push(...await Promise.all(batch.map((s) => Content.calculateCourseGrade(id, s.id, quizRows))));
+      grades.push(...await Promise.all(batch.map((s) => Content.calculateCourseGrade(courseIds, s.id, quizRows))));
     }
 
     const csv = toCsv(
@@ -849,7 +858,9 @@ export const exportStudentGrades = async (req, res) => {
       return res.status(404).json({ success: false, message: t(req.locale, 'errors.student_not_found') });
     }
 
-    const { items, total } = await Content.getCourseGradeBreakdown(id, studentId, null, req.locale);
+    // Mismo criterio de grupo combinado que getCourseStudents/exportCourseGrades.
+    const courseIds = course.parent_module_id ? [id] : await Course.getProgressGroupIds(id);
+    const { items, total } = await Content.getCourseGradeBreakdown(courseIds, studentId, null, req.locale);
 
     const rows = items.map((item) => [item.title, item.type, item.weight_percent, item.earned]);
     rows.push([t(req.locale, 'labels.csv_final_grade_label'), '', '', total ?? '']);

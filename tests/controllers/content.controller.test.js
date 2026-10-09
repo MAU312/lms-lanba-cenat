@@ -35,6 +35,42 @@ test('createTaskContent: 201 con archivo de instrucciones adjunto', async (t) =>
   assert.equal(created.file_size, 2048);
 });
 
+test('createTaskContent: con weight_percent dentro del total disponible, crea normalmente', async (t) => {
+  const createCall = t.mock.method(Content, 'create', async () => 52);
+  t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 70);
+  const req = mockReq({ body: { course_id: 1, title: 'Ensayo final', weight_percent: '20' } });
+  const res = mockRes();
+  await contentController.createTaskContent(req, res);
+
+  assert.equal(res.statusCode, 201);
+  assert.equal(createCall.mock.calls[0].arguments[0].weight_percent, 20);
+});
+
+test('createTaskContent: 400 si el weight_percent hace que el total del curso/módulo supere 100', async (t) => {
+  const createCall = t.mock.method(Content, 'create', async () => 53);
+  t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 85);
+  const req = mockReq({ body: { course_id: 1, title: 'Ensayo final', weight_percent: '20' } });
+  const res = mockRes();
+  await contentController.createTaskContent(req, res);
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(createCall.mock.calls.length, 0, 'no debe crear el contenido si el total se pasa de 100');
+});
+
+test('createTaskContent: weight_percent que supera el total, borra el archivo ya subido (no lo deja huérfano)', async (t) => {
+  t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 90);
+  const deleteCall = t.mock.method(fs.promises, 'unlink', async () => {});
+  const req = mockReq({
+    body: { course_id: 1, title: 'Ensayo final', weight_percent: '15' },
+    file: { filename: 'instrucciones-999.pdf', size: 100 }
+  });
+  const res = mockRes();
+  await contentController.createTaskContent(req, res);
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(deleteCall.mock.calls.length, 1);
+});
+
 test('createForumContent: 201 con título y texto principal', async (t) => {
   const createCall = t.mock.method(Content, 'create', async () => 60);
   const req = mockReq({ body: { course_id: 1, title: 'Discusión del capítulo 3', description: '¿Qué opinan del capítulo 3?' } });
@@ -635,6 +671,32 @@ test('updateContent: weight_percent inválido con archivo nuevo adjunto no lo de
   assert.equal(res.statusCode, 400);
   assert.equal(unlinkCall.mock.calls.length, 1, 'el archivo de reemplazo ya escrito a disco no debe quedar huérfano');
   assert.match(unlinkCall.mock.calls[0].arguments[0], /nuevo\.pdf$/);
+});
+
+test('updateContent: al editar el peso de una tarea existente, excluye su propio valor actual de la suma (no se cuenta dos veces)', async (t) => {
+  t.mock.method(Content, 'findById', async () => ({ id: 7, type: 'task', course_id: 1 }));
+  const sumCall = t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 60); // ya excluye la fila 7
+  t.mock.method(Content, 'update', async () => 1);
+  const req = mockReq({ params: { id: 7 }, body: { weight_percent: '40' } }); // 60+40=100, justo al límite
+  const res = mockRes();
+
+  await contentController.updateContent(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(sumCall.mock.calls[0].arguments, [1, 7], 'debe pasar el course_id y excluir el propio id de la tarea');
+});
+
+test('updateContent: 400 si el nuevo peso hace que el total del curso/módulo supere 100', async (t) => {
+  t.mock.method(Content, 'findById', async () => ({ id: 7, type: 'quiz', course_id: 1 }));
+  t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 60);
+  const updateCall = t.mock.method(Content, 'update', async () => 1);
+  const req = mockReq({ params: { id: 7 }, body: { weight_percent: '41' } }); // 60+41=101
+
+  const res = mockRes();
+  await contentController.updateContent(req, res);
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(updateCall.mock.calls.length, 0);
 });
 
 test('updateContent: folder_id inválido con archivo nuevo adjunto no lo deja huérfano', async (t) => {

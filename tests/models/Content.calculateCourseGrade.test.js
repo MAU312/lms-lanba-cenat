@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import pool from '../../src/config/db.js';
 import Content from '../../src/models/Content.js';
+import Course from '../../src/models/Course.js';
 
 test('calculateCourseGrade: null si no hay nada calificado con peso todavía (ni tareas ni cuestionarios)', async (t) => {
   t.mock.method(pool, 'query', async (sql) => {
@@ -112,4 +113,66 @@ test('calculateCourseGrade: con varios cuestionarios, trae TODAS las respuestas 
   // Quiz A: 1/1 = 100% x 10 = 10. Quiz B: 1/2 = 50% x 30 = 15.
   assert.equal(items.find((i) => i.title === 'Quiz A').earned, 10);
   assert.equal(items.find((i) => i.title === 'Quiz B').earned, 15);
+});
+
+test('calculateCourseGrade: acepta un arreglo de course_id (curso padre + cursos hijo de un módulo) y combina lo calificado en cualquiera de ellos', async (t) => {
+  let taskQuery, quizQuery;
+  t.mock.method(pool, 'query', async (sql, params) => {
+    if (sql.includes('FROM task_submissions')) {
+      taskQuery = { sql, params };
+      // Una tarea calificada en el curso padre (17) y otra en un curso hijo (21).
+      return [[{ score_earned: 20 }, { score_earned: 50 }]];
+    }
+    if (sql.includes("type = 'quiz'")) {
+      quizQuery = { sql, params };
+      return [[]];
+    }
+    throw new Error('query no esperada: ' + sql);
+  });
+
+  const grade = await Content.calculateCourseGrade([17, 18, 19, 20, 21], 181);
+
+  assert.match(taskQuery.sql, /course_id IN \(\?\)/, 'debe usar IN en vez de = para aceptar varios cursos');
+  assert.deepEqual(taskQuery.params[0], [17, 18, 19, 20, 21]);
+  assert.match(quizQuery.sql, /course_id IN \(\?\)/);
+  assert.equal(grade, 70, 'suma las dos tareas calificadas sin importar en qué curso del grupo esté cada una');
+});
+
+test('calculateCourseGrade: con un solo course_id (número, no arreglo) se comporta igual que antes', async (t) => {
+  t.mock.method(pool, 'query', async (sql) => {
+    if (sql.includes('FROM task_submissions')) return [[{ score_earned: 9 }]];
+    if (sql.includes("type = 'quiz'")) return [[]];
+    throw new Error('query no esperada: ' + sql);
+  });
+
+  const grade = await Content.calculateCourseGrade(1, 5);
+  assert.equal(grade, 9);
+});
+
+test('getAssignedWeightPercentSum: resuelve el grupo de módulos (padre + hijos) y suma solo task/quiz con peso', async (t) => {
+  t.mock.method(Course, 'resolveEnrollmentRoot', async () => 17);
+  t.mock.method(Course, 'getProgressGroupIds', async () => [17, 18, 19, 20, 21]);
+  const queryCall = t.mock.method(pool, 'query', async () => [[{ total: '75.50' }]]);
+
+  const sum = await Content.getAssignedWeightPercentSum(21);
+
+  assert.equal(sum, 75.5);
+  const [sql, params] = queryCall.mock.calls[0].arguments;
+  assert.match(sql, /course_id IN \(\?\)/);
+  assert.match(sql, /type IN \('task', 'quiz'\)/);
+  assert.deepEqual(params[0], [17, 18, 19, 20, 21]);
+  assert.equal(params.length, 1, 'sin excludeId, no debe agregar un segundo parámetro');
+});
+
+test('getAssignedWeightPercentSum: con excludeId, lo saca de la suma para no contar la propia fila que se está editando', async (t) => {
+  t.mock.method(Course, 'resolveEnrollmentRoot', async () => 17);
+  t.mock.method(Course, 'getProgressGroupIds', async () => [17]);
+  const queryCall = t.mock.method(pool, 'query', async () => [[{ total: '40' }]]);
+
+  const sum = await Content.getAssignedWeightPercentSum(17, 110);
+
+  assert.equal(sum, 40);
+  const [sql, params] = queryCall.mock.calls[0].arguments;
+  assert.match(sql, /AND id != \?/);
+  assert.deepEqual(params, [[17], 110]);
 });

@@ -275,6 +275,16 @@ async function createQuestionContent(req, res, type) {
       await cleanupUploadedFiles(req.files);
       return res.status(400).json({ success: false, message: weightCheck.message });
     }
+    if (weightCheck.value !== null) {
+      const assigned = await Content.getAssignedWeightPercentSum(course_id);
+      if (assigned + weightCheck.value > 100) {
+        await cleanupUploadedFiles(req.files);
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.weight_percent_exceeds_total', { assigned, max: Math.max(0, 100 - assigned) })
+        });
+      }
+    }
 
     const folderCheck = await resolveFolderId(folder_id, course_id);
     if (!folderCheck.ok) {
@@ -416,6 +426,16 @@ export const updateQuestions = async (req, res) => {
     if (!weightCheck.ok) {
       await cleanupUploadedFiles(req.files);
       return res.status(400).json({ success: false, message: weightCheck.message });
+    }
+    if (weightCheck.value !== null) {
+      const assigned = await Content.getAssignedWeightPercentSum(content.course_id, content.id);
+      if (assigned + weightCheck.value > 100) {
+        await cleanupUploadedFiles(req.files);
+        return res.status(400).json({
+          success: false,
+          message: t(req.locale, 'errors.weight_percent_exceeds_total', { assigned, max: Math.max(0, 100 - assigned) })
+        });
+      }
     }
 
     const respondentCount = await ContentAnswer.countRespondents(id);

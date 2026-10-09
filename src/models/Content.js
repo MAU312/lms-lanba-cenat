@@ -367,6 +367,32 @@ class Content {
   }
 
   /**
+   * Suma de weight_percent ya asignado a tareas/cuestionarios del GRUPO de
+   * módulos de un curso (padre + cursos hijo — mismo criterio que la nota
+   * final combinada, ver getCourseGradeBreakdown), para validar al crear o
+   * editar un peso que el total del grupo nunca pase de 100. `excludeId`
+   * saca una fila puntual de la suma (la propia tarea/cuestionario que se
+   * está editando, para no contarla dos veces contra su propio valor
+   * nuevo).
+   */
+  static async getAssignedWeightPercentSum(courseId, excludeId = null) {
+    const rootId = await Course.resolveEnrollmentRoot(courseId);
+    const courseIds = await Course.getProgressGroupIds(rootId);
+    const params = [courseIds];
+    let excludeClause = '';
+    if (excludeId !== null) {
+      excludeClause = 'AND id != ?';
+      params.push(excludeId);
+    }
+    const [rows] = await pool.query(
+      `SELECT COALESCE(SUM(weight_percent), 0) AS total FROM contents
+       WHERE course_id IN (?) AND weight_percent IS NOT NULL AND type IN ('task', 'quiz') ${excludeClause}`,
+      params
+    );
+    return Number(rows[0].total);
+  }
+
+  /**
    * Detalle de la nota de un estudiante en un curso: un item por cada
    * tarea calificada CON weight_percent, y por cada cuestionario CON
    * weight_percent que el estudiante ya respondió POR COMPLETO —
@@ -386,23 +412,30 @@ class Content {
    * pide una sola vez y se la pasa a getCourseGradeBreakdown/
    * calculateCourseGrade en vez de dejar que cada llamada (una POR
    * estudiante) la repita idéntica.
+   *
+   * `courseIds` acepta un único id o un arreglo — un curso con módulos pasa
+   * el grupo completo (padre + cursos hijo, ver Course.getProgressGroupIds)
+   * para que la nota final combine lo calificado en cualquiera de ellos,
+   * mismo criterio que ya usa el progreso combinado.
    */
-  static async getGradableQuizzes(courseId) {
+  static async getGradableQuizzes(courseIds) {
+    const ids = Array.isArray(courseIds) ? courseIds : [courseIds];
     const [rows] = await pool.query(
-      `SELECT id, title, weight_percent FROM contents WHERE course_id = ? AND type = 'quiz' AND weight_percent IS NOT NULL`,
-      [courseId]
+      `SELECT id, title, weight_percent FROM contents WHERE course_id IN (?) AND type = 'quiz' AND weight_percent IS NOT NULL`,
+      [ids]
     );
     return rows;
   }
 
-  static async getCourseGradeBreakdown(courseId, userId, quizRows = null, locale = DEFAULT_LOCALE) {
+  static async getCourseGradeBreakdown(courseIds, userId, quizRows = null, locale = DEFAULT_LOCALE) {
+    const ids = Array.isArray(courseIds) ? courseIds : [courseIds];
     const [taskRows] = await pool.query(
       `SELECT c.title, c.weight_percent, ts.score_earned
        FROM task_submissions ts
        INNER JOIN contents c ON c.id = ts.content_id
-       WHERE c.course_id = ? AND ts.user_id = ? AND c.type = 'task'
+       WHERE c.course_id IN (?) AND ts.user_id = ? AND c.type = 'task'
          AND c.weight_percent IS NOT NULL AND ts.score_earned IS NOT NULL`,
-      [courseId, userId]
+      [ids, userId]
     );
 
     const items = taskRows.map((row) => ({
@@ -413,7 +446,7 @@ class Content {
     }));
 
     if (quizRows === null) {
-      quizRows = await Content.getGradableQuizzes(courseId);
+      quizRows = await Content.getGradableQuizzes(ids);
     }
 
     // Una sola query para las respuestas de TODOS los cuestionarios del
@@ -463,8 +496,8 @@ class Content {
    * para el detalle de cómo se calcula cada item. `quizRows` opcional, ver
    * getGradableQuizzes.
    */
-  static async calculateCourseGrade(courseId, userId, quizRows = null) {
-    const { total } = await Content.getCourseGradeBreakdown(courseId, userId, quizRows);
+  static async calculateCourseGrade(courseIds, userId, quizRows = null) {
+    const { total } = await Content.getCourseGradeBreakdown(courseIds, userId, quizRows);
     return total;
   }
 }

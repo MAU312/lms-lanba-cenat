@@ -212,6 +212,68 @@ test('createQuizContent: 400 si multiple_choice no tiene exactamente una opción
   assert.equal(res.statusCode, 400);
 });
 
+test('createQuizContent: 400 si el weight_percent hace que el total del curso/módulo supere 100', async (t) => {
+  t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 90);
+  const createContentCall = t.mock.method(Content, 'create', async () => 50);
+  const req = mockReq({
+    body: {
+      course_id: 1,
+      title: 'Quiz',
+      weight_percent: '20',
+      questions: [{ text: 'x', question_type: 'short_answer' }]
+    }
+  });
+  const res = mockRes();
+  await quizController.createQuizContent(req, res);
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(createContentCall.mock.calls.length, 0, 'no debe crear el content si el total se pasa de 100');
+});
+
+test('createQuizContent: una encuesta nunca valida el total (weight_percent siempre queda en null para survey)', async (t) => {
+  const { connection } = mockConnection();
+  t.mock.method(pool, 'getConnection', async () => connection);
+  const sumCall = t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 95);
+  t.mock.method(Content, 'create', async () => 50);
+  t.mock.method(ContentQuestion, 'create', async () => 1);
+  t.mock.method(ContentQuestion, 'createOptions', async () => {});
+
+  const req = mockReq({
+    body: {
+      course_id: 1,
+      title: 'Encuesta',
+      weight_percent: '20', // una encuesta ignora este campo (ver isQuiz en el controller)
+      questions: [{ text: 'x', question_type: 'short_answer' }]
+    }
+  });
+  const res = mockRes();
+  await quizController.createSurveyContent(req, res);
+
+  assert.equal(res.statusCode, 201);
+  assert.equal(sumCall.mock.calls.length, 0, 'una encuesta no tiene weight_percent, así que ni siquiera debe consultar el total');
+});
+
+test('updateQuestions: 400 si el nuevo weight_percent hace que el total del curso/módulo supere 100', async (t) => {
+  t.mock.method(Content, 'findById', async () => ({ id: 40, type: 'quiz', course_id: 1, description: 'vieja' }));
+  t.mock.method(ContentAnswer, 'countRespondents', async () => 0);
+  t.mock.method(Content, 'getAssignedWeightPercentSum', async () => 85);
+  const updateCall = t.mock.method(Content, 'update', async () => 1);
+
+  const req = mockReq({
+    params: { id: 40 },
+    body: {
+      title: 'Quiz',
+      weight_percent: '20', // 85+20=105
+      questions: [{ text: 'x', question_type: 'short_answer' }]
+    }
+  });
+  const res = mockRes();
+  await quizController.updateQuestions(req, res);
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(updateCall.mock.calls.length, 0);
+});
+
 test('getQuestionsForManage: devuelve las preguntas (cada una con su propio question_type) CON is_correct, y el conteo de respondentes', async (t) => {
   t.mock.method(Content, 'findById', async () => ({ id: 40, type: 'quiz' }));
   t.mock.method(ContentQuestion, 'findByContent', async (id, opts) => {

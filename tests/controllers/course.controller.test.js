@@ -652,6 +652,7 @@ test('getCourseStudents: devuelve el curso, la lista de estudiantes con su progr
     ],
     total: 2
   }));
+  t.mock.method(Course, 'getProgressGroupIds', async (id) => [id]);
   t.mock.method(Content, 'getGradableQuizzes', async () => []);
   t.mock.method(Content, 'calculateCourseGrade', async () => null);
 
@@ -669,6 +670,7 @@ test('getCourseStudents: devuelve el curso, la lista de estudiantes con su progr
 test('getCourseStudents: limita el "limit" recibido por query string a un máximo de 50', async (t) => {
   t.mock.method(Course, 'findById', async () => ({ id: 1, title: 'Curso' }));
   const getStudentsCall = t.mock.method(Course, 'getEnrolledStudents', async () => ({ rows: [], total: 0 }));
+  t.mock.method(Course, 'getProgressGroupIds', async (id) => [id]);
   t.mock.method(Content, 'getGradableQuizzes', async () => []);
   t.mock.method(Content, 'calculateCourseGrade', async () => null);
 
@@ -688,6 +690,7 @@ test('getCourseStudents: adjunta la nota calculada de cada estudiante (Content.c
     ],
     total: 2
   }));
+  t.mock.method(Course, 'getProgressGroupIds', async (id) => [id]);
   t.mock.method(Content, 'getGradableQuizzes', async () => []);
   const gradeCall = t.mock.method(Content, 'calculateCourseGrade', async (courseId, userId) => (userId === 2 ? 85.5 : null));
 
@@ -698,6 +701,26 @@ test('getCourseStudents: adjunta la nota calculada de cada estudiante (Content.c
   assert.equal(res.body.data.students[0].grade, 85.5);
   assert.equal(res.body.data.students[1].grade, null);
   assert.equal(gradeCall.mock.calls.length, 2);
+});
+
+test('getCourseStudents: si el curso consultado es el padre, la nota combina el grupo completo (padre + cursos hijo)', async (t) => {
+  t.mock.method(Course, 'findById', async () => ({ id: 17, title: 'Demo', parent_module_id: null }));
+  t.mock.method(Course, 'getEnrolledStudents', async () => ({
+    rows: [{ id: 2, name: 'Ana', email: 'ana@test.com', progress: 100 }],
+    total: 1
+  }));
+  const groupCall = t.mock.method(Course, 'getProgressGroupIds', async () => [17, 18, 19, 20, 21]);
+  const quizCall = t.mock.method(Content, 'getGradableQuizzes', async () => []);
+  const gradeCall = t.mock.method(Content, 'calculateCourseGrade', async () => 55);
+
+  const req = mockReq({ params: { id: 17 }, query: {} });
+  const res = mockRes();
+  await courseController.getCourseStudents(req, res);
+
+  assert.equal(groupCall.mock.calls.length, 1, 'debe resolver el grupo de módulos cuando el curso consultado es el padre');
+  assert.deepEqual(quizCall.mock.calls[0].arguments[0], [17, 18, 19, 20, 21]);
+  assert.deepEqual(gradeCall.mock.calls[0].arguments[0], [17, 18, 19, 20, 21]);
+  assert.equal(res.body.data.students[0].grade, 55);
 });
 
 test('getCourseStudents: si el curso consultado es un curso hijo, reemplaza el progreso combinado por el progreso puntual de ese curso', async (t) => {
@@ -935,6 +958,7 @@ test('exportCourseGrades: arma un CSV con nombre/email/progreso/nota de cada est
     ],
     total: 2
   }));
+  t.mock.method(Course, 'getProgressGroupIds', async (id) => [id]);
   t.mock.method(Content, 'getGradableQuizzes', async () => []);
   t.mock.method(Content, 'calculateCourseGrade', async (courseId, userId) => (userId === 2 ? 90 : null));
 
@@ -990,6 +1014,7 @@ test('exportStudentGrades: arma un CSV con el detalle de cada item calificado m�
   t.mock.method(Course, 'findById', async () => ({ id: 1, title: 'Curso' }));
   t.mock.method(User, 'findById', async () => ({ id: 2, name: 'Ana Rojas' }));
   t.mock.method(Course, 'isUserEnrolled', async () => true);
+  t.mock.method(Course, 'getProgressGroupIds', async (id) => [id]);
   t.mock.method(Content, 'getCourseGradeBreakdown', async () => ({
     items: [
       { title: 'Tarea 1', type: 'Tarea', weight_percent: 10, earned: 7 },
