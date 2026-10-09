@@ -146,8 +146,8 @@ lms-cenat/
 
 ```bash
 # 1. Clonar el repositorio
-git clone https://github.com/MAU312/plataformaLMS.git
-cd plataformaLMS
+git clone https://github.com/MAU312/lms-lanba-cenat.git
+cd lms-lanba-cenat
 
 # 2. Instalar dependencias
 npm install
